@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Watchroom</title>
+<meta name="description" content="Watch YouTube and video links in sync with friends. Make a room, share the link, press play.">
+<meta name="theme-color" content="#121119">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23121119'/%3E%3Cpath d='M12 9.5v13l11-6.5z' fill='%23ffb547'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,800&family=Figtree:wght@400;500;600;700&family=JetBrains+Mono:wght@500;700&display=swap">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<!-- ============ LOBBY ============ -->
+<main id="lobby" class="lobby">
+  <div class="lobby-inner">
+    <div class="brand brand-lg"><span class="brand-mark" aria-hidden="true"></span>watchroom</div>
+    <h1 class="lobby-title">Press play together.</h1>
+    <p class="lobby-lede">Make a room, send the link, and everyone watches the same YouTube video or video file at the same second. Pause, skip and queue for the whole room. No account, no install.</p>
+
+    <form id="lobby-form" class="lobby-card" autocomplete="off">
+      <label class="field-label" for="name-input">Your name</label>
+      <input id="name-input" class="input" maxlength="24" placeholder="e.g. Jeff" required>
+
+      <button id="create-btn" class="btn btn-primary btn-wide" type="submit">Create a room</button>
+
+      <div class="or"><span>or join one</span></div>
+
+      <div class="join-row">
+        <label class="sr-only" for="code-input">Room code</label>
+        <input id="code-input" class="input input-code" maxlength="6" placeholder="ROOM CODE" spellcheck="false" autocapitalize="characters">
+        <button id="join-btn" class="btn btn-ghost" type="button">Join</button>
+      </div>
+      <p id="lobby-error" class="form-error" role="alert" hidden></p>
+    </form>
+
+    <ul class="lobby-facts">
+      <li><strong>YouTube</strong> links, plus direct <strong>.mp4 / .webm / .m3u8</strong> files</li>
+      <li>Shared <strong>queue</strong>, <strong>chat</strong> and controls for everyone</li>
+      <li>Runs peer-to-peer in your browsers</li>
+    </ul>
+  </div>
+</main>
+
+<!-- ============ ROOM ============ -->
+<div id="room" class="room" hidden>
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark" aria-hidden="true"></span>watchroom</div>
+
+    <button id="invite-btn" class="room-code" type="button" title="Copy invite link">
+      <span class="room-code-label">Room</span>
+      <span id="room-code" class="room-code-value">------</span>
+      <span class="room-code-copy">Copy link</span>
+    </button>
+
+    <div class="topbar-right">
+      <div id="sync-pill" class="pill pill-wait"><span class="dot"></span><span id="sync-text">Connecting</span></div>
+      <button id="leave-btn" class="btn btn-ghost btn-sm" type="button">Leave</button>
+    </div>
+  </header>
+
+  <div class="room-grid">
+    <section class="stage-col" aria-label="Player">
+      <div id="stage" class="stage">
+        <div id="yt-wrap" class="stage-layer" hidden><div id="yt-player"></div></div>
+        <video id="video-player" class="stage-layer" controls playsinline hidden></video>
+
+        <div id="stage-empty" class="stage-empty">
+          <div class="reel" aria-hidden="true"><span></span><span></span><span></span></div>
+          <p class="stage-empty-title">Nothing playing yet</p>
+          <p class="stage-empty-sub">Paste a YouTube link or a video file URL below.</p>
+        </div>
+
+        <div id="stage-error" class="stage-msg" hidden>
+          <p id="stage-error-text"></p>
+          <div class="stage-msg-actions">
+            <a id="stage-error-link" class="btn btn-ghost btn-sm" target="_blank" rel="noopener" hidden>Open on YouTube</a>
+            <button id="stage-error-next" class="btn btn-primary btn-sm" type="button">Skip to next</button>
+          </div>
+        </div>
+
+        <button id="unmute-overlay" class="stage-tap" type="button" hidden>
+          <span class="stage-tap-icon" aria-hidden="true"></span>
+          <span>Tap to join playback</span>
+        </button>
+      </div>
+
+      <form id="add-form" class="add-bar" autocomplete="off">
+        <label class="sr-only" for="url-input">Video link</label>
+        <input id="url-input" class="input" placeholder="Paste a YouTube or video link">
+        <div class="add-actions">
+          <button class="btn btn-primary" type="submit" data-mode="play">Play now</button>
+          <button class="btn btn-ghost" type="submit" data-mode="queue">Add to queue</button>
+        </div>
+      </form>
+
+      <div class="now">
+        <div class="now-meta">
+          <span class="eyebrow">Now playing</span>
+          <span id="now-title" class="now-title">—</span>
+          <span id="now-by" class="now-by"></span>
+        </div>
+        <button id="next-btn" class="btn btn-ghost btn-sm" type="button" disabled>Next in queue</button>
+      </div>
+    </section>
+
+    <aside class="side" aria-label="Room panel">
+      <div class="tabs" role="tablist">
+        <button class="tab is-active" role="tab" id="tab-chat" aria-selected="true" aria-controls="panel-chat" data-tab="chat">Chat</button>
+        <button class="tab" role="tab" id="tab-queue" aria-selected="false" aria-controls="panel-queue" data-tab="queue">Queue <span id="queue-count" class="count">0</span></button>
+        <button class="tab" role="tab" id="tab-people" aria-selected="false" aria-controls="panel-people" data-tab="people">People <span id="people-count" class="count">1</span></button>
+      </div>
+
+      <section id="panel-chat" class="panel" role="tabpanel" aria-labelledby="tab-chat">
+        <ol id="chat-list" class="chat-list" aria-live="polite"></ol>
+        <form id="chat-form" class="chat-form" autocomplete="off">
+          <label class="sr-only" for="chat-input">Message</label>
+          <input id="chat-input" class="input" maxlength="400" placeholder="Say something">
+          <button class="btn btn-primary btn-sm" type="submit">Send</button>
+        </form>
+      </section>
+
+      <section id="panel-queue" class="panel" role="tabpanel" aria-labelledby="tab-queue" hidden>
+        <ol id="queue-list" class="queue-list"></ol>
+        <p id="queue-empty" class="panel-empty">The queue is empty. Use <strong>Add to queue</strong> to line up the next video.</p>
+      </section>
+
+      <section id="panel-people" class="panel" role="tabpanel" aria-labelledby="tab-people" hidden>
+        <ul id="people-list" class="people-list"></ul>
+        <p class="panel-note">Everyone can play, pause, seek and change the video. The host's browser keeps the room in sync; if the host leaves, the next person takes over.</p>
+      </section>
+    </aside>
+  </div>
+</div>
+
+<div id="toast" class="toast" role="status" hidden></div>
+
+<script src="vendor/peerjs-1.5.4.min.js"></script>
+<script src="vendor/hls.light-1.5.13.min.js" defer></script>
+<script src="js/config.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
