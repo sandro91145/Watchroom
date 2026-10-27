@@ -68,6 +68,12 @@
         <div id="yt-wrap" class="stage-layer" hidden><div id="yt-player"></div></div>
         <video id="video-player" class="stage-layer" controls playsinline hidden></video>
 
+        <div id="share-layer" class="share-layer" hidden>
+          <video id="share-video" playsinline autoplay></video>
+          <div class="live-badge"><span class="live-dot" aria-hidden="true"></span><span>LIVE</span><span id="share-who"></span></div>
+          <p id="share-wait" class="share-wait" hidden></p>
+        </div>
+
         <div id="stage-empty" class="stage-empty">
           <div class="reel" aria-hidden="true"><span></span><span></span><span></span></div>
           <p class="stage-empty-title">Nothing playing yet</p>
@@ -84,7 +90,7 @@
 
         <button id="unmute-overlay" class="stage-tap" type="button" hidden>
           <span class="stage-tap-icon" aria-hidden="true"></span>
-          <span>Tap to join playback</span>
+          <span id="unmute-text">Tap to join playback</span>
         </button>
       </div>
 
@@ -94,8 +100,11 @@
         <div class="add-actions">
           <button class="btn btn-primary" type="submit" data-mode="play">Play now</button>
           <button class="btn btn-ghost" type="submit" data-mode="queue">Add to queue</button>
+          <button id="share-btn" class="btn btn-ghost" type="button">Share a tab</button>
+          <button id="stop-share-btn" class="btn btn-danger" type="button" hidden>Stop sharing</button>
         </div>
       </form>
+      <p id="share-hint" class="share-hint"><strong>Share a tab</strong> streams one of your browser tabs to the room, so you can open YouTube or any site there and everyone watches with you. Use Chrome or Edge and leave <strong>Share tab audio</strong> on.</p>
 
       <div class="now">
         <div class="now-meta">

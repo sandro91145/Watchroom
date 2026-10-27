@@ -60,7 +60,7 @@
   let migrating = false;
 
   function emptyRoom() {
-    return { media: null, playing: false, pos: 0, at: 0, rate: 1, queue: [], users: [] };
+    return { media: null, playing: false, pos: 0, at: 0, rate: 1, queue: [], users: [], share: null };
   }
   const hostNow = () => Date.now() + clockOffset;
   function expectedPos(r = room) {
@@ -404,6 +404,11 @@
 
   // ---------- keeping the local player in line with the room ----------
   function syncPlayer() {
+    if (room.share) {
+      // A live tab share replaces the player; keep the video paused underneath.
+      if (player.ready && player.isPlaying()) { player.suppress(); player.pause(); }
+      return;
+    }
     const want = room.media;
     if (!want) {
       if (player.media) player.load(null);
@@ -447,13 +452,18 @@
   function checkBlockedSoon() {
     const mid = room.media && room.media.uid;
     setTimeout(() => {
-      if (!room.playing || !room.media || room.media.uid !== mid || player.errored || !player.ready) return;
+      if (room.share || !room.playing || !room.media || room.media.uid !== mid || player.errored || !player.ready) return;
       if (!player.isPlaying()) $('unmute-overlay').hidden = false;
     }, 2200);
   }
 
   $('unmute-overlay').addEventListener('click', () => {
     $('unmute-overlay').hidden = true;
+    if (room.share && room.share.peer !== myId) {
+      shareVideo.muted = false;
+      shareVideo.play().catch(() => { /* still blocked */ });
+      return;
+    }
     if (player.kind === 'youtube' && player.yt) { try { player.yt.unMute(); } catch { /* ignore */ } }
     player.suppress();
     player.seek(expectedPos());
@@ -485,6 +495,7 @@
 
   const reportedTitles = new Set();
   function tick() {
+    if (room.share) return;
     if (!player.ready || player.errored || !room.media || !player.media || player.media.uid !== room.media.uid) return;
     const now = Date.now();
     const t = player.getTime();
@@ -525,6 +536,213 @@
     }
   }
   setInterval(tick, 500);
+
+  // =====================================================================
+  //  TAB SHARING — the sharer streams a tab straight to every viewer
+  // =====================================================================
+  const shareVideo = $('share-video');
+  const canShare = !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia);
+  let localShare = null;            // the MediaStream this browser is sending
+  let myShareSid = null;            // the room's id for my current share, once the host confirms it
+  let shareRequestedAt = 0;
+  const outCalls = new Map();       // sharer: viewer peer id -> MediaConnection
+  let viewCall = null;              // viewer: the call carrying the share
+  let viewSid = null;
+  let pendingCalls = [];            // calls that arrived before the room state named their sharer
+
+  async function startShare() {
+    if (!canShare) {
+      toast('Sharing needs Chrome, Edge or Firefox on a computer. You can still watch shares on this device.', 5000);
+      return;
+    }
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getDisplayMedia({
+        video: { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30, max: 30 } },
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+        preferCurrentTab: false,
+        selfBrowserSurface: 'exclude',
+        surfaceSwitching: 'include',
+        systemAudio: 'include',
+      });
+    } catch (e) {
+      if (e && (e.name === 'NotAllowedError' || e.name === 'AbortError')) return; // picker cancelled
+      toast("Couldn't start sharing. Check that your browser is allowed to share the screen.", 5000);
+      return;
+    }
+    if (localShare) stopLocalShare();
+    localShare = stream;
+    myShareSid = null;
+    shareRequestedAt = Date.now();
+    const vt = stream.getVideoTracks()[0];
+    if (vt) {
+      try { vt.contentHint = 'motion'; } catch { /* older browsers */ }
+      vt.addEventListener('ended', () => { if (localShare === stream) endMyShare(); });
+    }
+    if (!stream.getAudioTracks().length) {
+      toast('No sound is being shared. To include sound, stop, then share a Chrome or Edge tab with "Share tab audio" on.', 7000);
+    }
+    sendAction({ type: 'shareStart' });
+    renderShare();
+  }
+
+  function endMyShare() {
+    const sid = room.share && room.share.peer === myId ? room.share.sid : myShareSid;
+    stopLocalShare();
+    if (sid) sendAction({ type: 'shareStop', sid });
+  }
+
+  function stopLocalShare() {
+    for (const c of outCalls.values()) { try { c.close(); } catch { /* ignore */ } }
+    outCalls.clear();
+    if (localShare) {
+      localShare.getTracks().forEach((t) => t.stop());
+      localShare = null;
+    }
+    myShareSid = null;
+    if (shareVideo.srcObject && !viewCall) shareVideo.srcObject = null;
+    renderShare();
+  }
+
+  function onIncomingCall(call) {
+    const sid = call.metadata && call.metadata.sid;
+    const s = room.share;
+    if (s && s.peer !== myId && call.peer === s.peer && sid === s.sid) return answerCall(call);
+    call._at = Date.now();
+    pendingCalls.push(call);
+  }
+
+  function answerCall(call) {
+    closeView();
+    viewCall = call;
+    viewSid = call.metadata && call.metadata.sid;
+    call.on('stream', (stream) => {
+      if (viewCall !== call) return;
+      shareVideo.srcObject = stream;
+      shareVideo.muted = false;
+      const p = shareVideo.play();
+      if (p && p.catch) {
+        p.catch(() => {
+          // Autoplay with sound was refused: play muted and offer sound on tap.
+          shareVideo.muted = true;
+          shareVideo.play().catch(() => { /* ignore */ });
+          $('unmute-text').textContent = 'Turn on sound';
+          $('unmute-overlay').classList.add('is-compact');
+          $('unmute-overlay').hidden = false;
+        });
+      }
+      renderShare();
+    });
+    const gone = () => {
+      if (viewCall !== call) return;
+      viewCall = null;
+      viewSid = null;
+      shareVideo.srcObject = null;
+      renderShare();
+    };
+    call.on('close', gone);
+    call.on('error', gone);
+    call.answer();
+  }
+
+  function closeView() {
+    if (viewCall) {
+      const c = viewCall;
+      viewCall = null;
+      viewSid = null;
+      try { c.close(); } catch { /* ignore */ }
+    }
+    if (!localShare) shareVideo.srcObject = null;
+  }
+
+  /** Brings calls in line with the room: who should receive my share, and which share I should watch. */
+  function reconcileShare() {
+    const s = room.share;
+
+    // Sharer side
+    if (localShare) {
+      if (s && s.peer === myId) {
+        myShareSid = s.sid;
+        const want = new Set(room.users.map((u) => u.id).filter((id) => id && id !== myId));
+        for (const [id, c] of outCalls) {
+          if (!want.has(id) || c._sid !== s.sid) { try { c.close(); } catch { /* ignore */ } outCalls.delete(id); }
+        }
+        for (const id of want) {
+          if (outCalls.has(id) || !peer || peer.destroyed || peer.disconnected) continue;
+          const c = peer.call(id, localShare, { metadata: { sid: s.sid } });
+          if (!c) continue;
+          c._sid = s.sid;
+          outCalls.set(id, c);
+          const drop = () => { if (outCalls.get(id) === c) outCalls.delete(id); };
+          c.on('close', drop);
+          c.on('error', drop);
+        }
+      } else if (myShareSid && (!s || s.sid !== myShareSid)) {
+        stopLocalShare();
+        toast(s ? `${s.name} started sharing, so your share ended.` : 'Your tab share ended.', 4000);
+      } else if (!myShareSid && Date.now() - shareRequestedAt > 12000) {
+        stopLocalShare();
+        toast("The room didn't start your share. Try again.", 4000);
+      }
+    }
+
+    // Viewer side
+    if (s && s.peer !== myId) {
+      if (viewCall && viewSid !== s.sid) closeView();
+      if (!viewCall) {
+        const i = pendingCalls.findIndex((c) => c.peer === s.peer && c.metadata && c.metadata.sid === s.sid);
+        if (i >= 0) answerCall(pendingCalls.splice(i, 1)[0]);
+      }
+    } else if (viewCall) {
+      closeView();
+    }
+
+    const now = Date.now();
+    pendingCalls = pendingCalls.filter((c) => {
+      if (now - c._at < 10000) return true;
+      try { c.close(); } catch { /* ignore */ }
+      return false;
+    });
+  }
+  setInterval(() => { if (myId) reconcileShare(); }, 4000);
+
+  function renderShare() {
+    const s = room.share;
+    const mine = !!(s && s.peer === myId);
+    $('stage').classList.toggle('is-sharing', !!s);
+    $('share-layer').hidden = !s;
+
+    if (s) {
+      $('share-who').textContent = mine ? 'You are sharing' : `${s.name} is sharing`;
+      if (mine && localShare) {
+        if (shareVideo.srcObject !== localShare) shareVideo.srcObject = localShare;
+        shareVideo.muted = true;           // you already hear the tab itself
+        shareVideo.controls = false;
+        shareVideo.play().catch(() => { /* preview only */ });
+      } else {
+        shareVideo.controls = true;
+      }
+      const waiting = !shareVideo.srcObject;
+      $('share-wait').hidden = !waiting;
+      if (waiting) $('share-wait').textContent = mine ? 'Starting your share…' : `Connecting to ${s.name}'s tab…`;
+    } else {
+      $('share-wait').hidden = true;
+      if (!localShare && shareVideo.srcObject) shareVideo.srcObject = null;
+      if ($('unmute-overlay').classList.contains('is-compact')) {
+        $('unmute-overlay').hidden = true;
+        $('unmute-overlay').classList.remove('is-compact');
+        $('unmute-text').textContent = 'Tap to join playback';
+      }
+    }
+
+    $('share-btn').hidden = !!localShare || !canShare;   // phones can watch shares but not start them
+    $('stop-share-btn').hidden = !localShare;
+    $('share-btn').title = 'Stream one of your browser tabs to the room';
+    $('share-hint').hidden = !!s || !canShare;
+  }
+
+  $('share-btn').addEventListener('click', startShare);
+  $('stop-share-btn').addEventListener('click', endMyShare);
 
   // =====================================================================
   //  HOST — owns the room state
@@ -585,6 +803,7 @@
       case 'load': {
         const m = hostMediaFrom(a, who);
         if (!m) return;
+        room.share = null;
         setMedia(m);
         systemMsg(`${who} started ${mediaLabel(m)}`);
         break;
@@ -592,13 +811,14 @@
       case 'enqueue': {
         const m = hostMediaFrom(a, who);
         if (!m) return;
-        if (!room.media) { setMedia(m); systemMsg(`${who} started ${mediaLabel(m)}`); }
+        if (!room.media) { room.share = null; setMedia(m); systemMsg(`${who} started ${mediaLabel(m)}`); }
         else if (room.queue.length < MAX_QUEUE) { room.queue.push(m); systemMsg(`${who} queued ${mediaLabel(m)}`); }
         else return;
         break;
       }
       case 'next': {
         if (a.mid && (!cur || a.mid !== cur.uid)) return;
+        if (!a.auto) room.share = null;
         const next = room.queue.shift();
         if (next) {
           setMedia(next);
@@ -615,6 +835,7 @@
         const i = room.queue.findIndex((q) => q.uid === a.uid);
         if (i < 0) return;
         const [m] = room.queue.splice(i, 1);
+        room.share = null;
         setMedia(m);
         systemMsg(`${who} started ${mediaLabel(m)}`);
         break;
@@ -625,6 +846,16 @@
         [room.queue[i - 1], room.queue[i]] = [room.queue[i], room.queue[i - 1]];
         break;
       }
+      case 'shareStart':
+        room.share = { peer: from, name: who, sid: uid() };
+        if (room.media && room.playing) { room.pos = expectedPos(); room.at = hostNow(); room.playing = false; }
+        systemMsg(`${who} started sharing a tab`);
+        break;
+      case 'shareStop':
+        if (!room.share || a.sid !== room.share.sid) return;
+        room.share = null;
+        systemMsg(`${who} stopped sharing`);
+        break;
       case 'remove': {
         const before = room.queue.length;
         room.queue = room.queue.filter((q) => q.uid !== a.uid);
@@ -731,6 +962,7 @@
     try { g.conn.close(); } catch { /* already closed */ }
     if (g.ready) {
       systemMsg(`${g.name} left`);
+      if (room.share && room.share.peer === id) room.share = null;
       broadcastState();
     }
   }
@@ -740,7 +972,19 @@
     if (!isHost) return;
     const now = Date.now();
     for (const [id, g] of guests) if (now - g.lastSeen > 15000) dropGuest(id);
+    const s = room.share;
+    const sharerHere = s && (s.peer === myId || (guests.get(s.peer) && guests.get(s.peer).ready));
+    if (s && !sharerHere) {
+      if (!shareMissingSince) shareMissingSince = now;
+      else if (now - shareMissingSince > 15000) {
+        shareMissingSince = 0;
+        room.share = null;
+        systemMsg(`${s.name}'s tab share ended`);
+        broadcastState();
+      }
+    } else shareMissingSince = 0;
   }, 4000);
+  let shareMissingSince = 0;
 
   // =====================================================================
   //  GUEST — follows the host
@@ -850,6 +1094,9 @@
       users: Array.isArray(r.users)
         ? r.users.slice(0, 100).map((u) => ({ id: String(u && u.id || ''), name: cleanName(u && u.name), host: !!(u && u.host) }))
         : [],
+      share: r.share && typeof r.share === 'object' && typeof r.share.peer === 'string'
+        ? { peer: r.share.peer.slice(0, 80), name: cleanName(r.share.name), sid: String(r.share.sid || '').slice(0, 40) }
+        : null,
     };
   }
 
@@ -913,12 +1160,20 @@
 
   function becomeHost(lastRoom) {
     const pos = expectedPos(lastRoom);
+    const oldId = myId;
+    const oldHost = lastRoom.users.find((u) => u.host);
     isHost = true;
     migrating = false;
     myId = peer.id;
     clockOffset = 0;
     guests.clear();
-    room = { ...lastRoom, pos, at: Date.now(), users: [] };
+    let share = lastRoom.share;
+    if (share && oldHost && share.peer === oldHost.id) share = null;
+    else if (share && share.peer === oldId) share = { ...share, peer: myId };
+    room = { ...lastRoom, pos, at: Date.now(), users: [], share };
+    for (const c of outCalls.values()) { try { c.close(); } catch { /* ignore */ } }
+    outCalls.clear();
+    closeView();
     wireHostPeer(peer);
     setConnected(true);
     systemMsg(`${myName} is now hosting`);
@@ -930,6 +1185,7 @@
   // =====================================================================
   function wireHostPeer(p) {
     p.on('connection', onGuestConnection);
+    p.on('call', onIncomingCall);
     p.on('disconnected', () => { if (!p.destroyed && !leaving) try { p.reconnect(); } catch { /* ignore */ } });
     p.on('error', onPeerError);
   }
@@ -970,6 +1226,7 @@
       onPeerError(err);
     });
     p.on('connection', onGuestConnection);
+    p.on('call', onIncomingCall);
     p.on('disconnected', () => { if (!p.destroyed && !leaving) try { p.reconnect(); } catch { /* ignore */ } });
   }
 
@@ -977,6 +1234,7 @@
     code = roomCode;
     const p = new Peer(PEER_OPTIONS);
     peer = p;
+    p.on('call', onIncomingCall);
     let opened = false;
     p.on('open', (id) => {
       opened = true;
@@ -1039,8 +1297,15 @@
 
   function render() {
     const m = room.media;
-    $('now-title').textContent = m ? (m.title || (m.kind === 'youtube' ? 'YouTube video' : 'Video')) : 'Nothing playing';
-    $('now-by').textContent = m ? `Added by ${m.by}` : '';
+    if (room.share) {
+      $('now-title').textContent = room.share.peer === myId ? 'Your tab' : `${room.share.name}'s tab`;
+      $('now-by').textContent = 'Live tab share';
+    } else {
+      $('now-title').textContent = m ? (m.title || (m.kind === 'youtube' ? 'YouTube video' : 'Video')) : 'Nothing playing';
+      $('now-by').textContent = m ? `Added by ${m.by}` : '';
+    }
+    renderShare();
+    reconcileShare();
     $('next-btn').disabled = room.queue.length === 0;
     $('stage-error-next').textContent = room.queue.length ? 'Skip to next' : 'Clear player';
     $('queue-count').textContent = room.queue.length;
@@ -1300,6 +1565,7 @@
 
   $('leave-btn').addEventListener('click', () => {
     leaving = true;
+    stopLocalShare();
     if (hostConn && hostConn.open) { try { hostConn.send({ t: 'bye' }); } catch { /* ignore */ } }
     setTimeout(() => {
       try { if (peer) peer.destroy(); } catch { /* ignore */ }
@@ -1309,6 +1575,7 @@
 
   window.addEventListener('pagehide', () => {
     leaving = true;
+    stopLocalShare();
     if (hostConn && hostConn.open) { try { hostConn.send({ t: 'bye' }); } catch { /* ignore */ } }
     try { if (peer) peer.destroy(); } catch { /* ignore */ }
   });
