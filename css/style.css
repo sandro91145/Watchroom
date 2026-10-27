@@ -329,6 +329,7 @@ a { color: var(--accent-text); }
 .panel { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .panel-empty, .panel-note { margin: 0; padding: 16px; color: var(--muted); font-size: 14px; }
 .panel-note { border-top: 1px solid var(--line); margin-top: auto; }
+.build-tag { margin: 0; padding: 0 16px 12px; font-family: var(--f-mono); font-size: 11px; color: var(--muted); }
 
 /* chat */
 .chat-list {

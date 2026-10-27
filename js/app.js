@@ -555,20 +555,18 @@
       toast('Sharing needs Chrome, Edge or Firefox on a computer. You can still watch shares on this device.', 5000);
       return;
     }
+    const btn = $('share-btn');
+    btn.disabled = true;
+    btn.textContent = 'Choose a tab…';
     let stream;
     try {
-      stream = await navigator.mediaDevices.getDisplayMedia({
-        video: { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30, max: 30 } },
-        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
-        preferCurrentTab: false,
-        selfBrowserSurface: 'exclude',
-        surfaceSwitching: 'include',
-        systemAudio: 'include',
-      });
+      stream = await pickDisplay();
     } catch (e) {
-      if (e && (e.name === 'NotAllowedError' || e.name === 'AbortError')) return; // picker cancelled
-      toast("Couldn't start sharing. Check that your browser is allowed to share the screen.", 5000);
+      shareStartError(e);
       return;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Share a tab';
     }
     if (localShare) stopLocalShare();
     localShare = stream;
@@ -584,6 +582,42 @@
     }
     sendAction({ type: 'shareStart' });
     renderShare();
+  }
+
+  async function pickDisplay() {
+    const rich = {
+      video: { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30, max: 30 } },
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+      preferCurrentTab: false,
+      selfBrowserSurface: 'exclude',
+      surfaceSwitching: 'include',
+      systemAudio: 'include',
+    };
+    const startedAt = Date.now();
+    try {
+      return await navigator.mediaDevices.getDisplayMedia(rich);
+    } catch (e) {
+      e.fastFail = Date.now() - startedAt < 600;
+      // Some browsers reject options they don't know; try once with the basics.
+      if (e && (e.name === 'TypeError' || e.name === 'OverconstrainedError' || e.name === 'NotSupportedError')) {
+        return navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+      }
+      throw e;
+    }
+  }
+
+  function shareStartError(e) {
+    const name = (e && e.name) || 'Error';
+    const msg = String((e && e.message) || '');
+    if (name === 'NotAllowedError' && /system/i.test(msg)) {
+      toast('Your computer is blocking screen sharing for this browser. On a Mac, turn your browser on in System Settings → Privacy & Security → Screen Recording, then restart it.', 10000);
+    } else if ((name === 'NotAllowedError' || name === 'AbortError') && e.fastFail) {
+      toast('Your browser blocked the share window. Click the icon at the left of the address bar, allow screen sharing for this site, then try again.', 9000);
+    } else if (name === 'NotAllowedError' || name === 'AbortError') {
+      // The person closed the picker; nothing to report.
+    } else {
+      toast(`Couldn't start sharing (${name}${msg ? ': ' + msg : ''}). Try Chrome or Edge on a computer.`, 9000);
+    }
   }
 
   function endMyShare() {
@@ -1582,6 +1616,8 @@
 
   // ---------- boot ----------
   (function boot() {
+    const tag = $('build-tag');
+    if (tag) tag.textContent = tag.dataset.build === '__BUILD__' ? 'dev' : tag.dataset.build;
     const saved = store.get('watchroom-name');
     if (saved) $('name-input').value = saved;
     if (!window.Peer) {
