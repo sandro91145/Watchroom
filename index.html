@@ -112,6 +112,7 @@
     <section class="stage-col" aria-label="Player">
       <div id="stage" class="stage">
         <div id="yt-wrap" class="stage-layer" hidden><div id="yt-player"></div></div>
+        <div id="ext-wrap" class="stage-layer" hidden></div>
         <video id="video-player" class="stage-layer" controls playsinline hidden></video>
 
         <div id="share-layer" class="share-layer" hidden>
@@ -129,10 +130,12 @@
         <div id="stage-error" class="stage-msg" hidden>
           <p id="stage-error-text"></p>
           <div class="stage-msg-actions">
-            <a id="stage-error-link" class="btn btn-ghost btn-sm" target="_blank" rel="noopener" hidden>Open on YouTube</a>
+            <a id="stage-error-link" class="btn btn-ghost btn-sm" target="_blank" rel="noopener" hidden>Open the original</a>
             <button id="stage-error-next" class="btn btn-primary btn-sm" type="button">Skip to next</button>
           </div>
         </div>
+
+        <div id="wait-banner" class="wait-banner" role="status" hidden><span class="spinner" aria-hidden="true"></span><span id="wait-text"></span></div>
 
         <button id="unmute-overlay" class="stage-tap" type="button" hidden>
           <span class="stage-tap-icon" aria-hidden="true"></span>
@@ -150,6 +153,15 @@
           <button id="stop-share-btn" class="btn btn-danger" type="button" hidden>Stop sharing</button>
         </div>
       </form>
+      <section id="search-results" class="search-results" aria-label="YouTube search results" hidden>
+        <div class="search-head">
+          <span id="search-title" class="eyebrow">Results</span>
+          <button id="search-close" class="icon-btn" type="button" aria-label="Close search results">✕</button>
+        </div>
+        <p id="search-status" class="search-status" hidden></p>
+        <ul id="search-list" class="search-list"></ul>
+      </section>
+
       <p id="share-hint" class="share-hint"><strong>Share a tab</strong> streams one of your browser tabs to the room, so you can open YouTube or any site there and everyone watches with you. Use Chrome or Edge and leave <strong>Share tab audio</strong> on.</p>
 
       <div class="now">
@@ -199,7 +211,26 @@
           <button id="people-invite" class="btn btn-primary btn-sm btn-wide" type="button">Invite people</button>
         </div>
         <ul id="people-list" class="people-list"></ul>
-        <p class="panel-note">Everyone can play, pause, seek and change the video. The host's browser keeps the room in sync; if the host leaves, the next person takes over.</p>
+        <section id="room-settings" class="settings" hidden>
+          <h3 class="settings-title">Room settings</h3>
+          <div class="setting"><span class="setting-label">Play, pause &amp; skip</span>
+            <div class="seg" data-setting="playback" role="group" aria-label="Who can control playback"><button type="button" data-v="all">Everyone</button><button type="button" data-v="mods">Moderators</button></div></div>
+          <div class="setting"><span class="setting-label">Add videos</span>
+            <div class="seg" data-setting="adding" role="group" aria-label="Who can add videos"><button type="button" data-v="all">Everyone</button><button type="button" data-v="mods">Moderators</button></div></div>
+          <div class="setting"><span class="setting-label">Chat</span>
+            <div class="seg" data-setting="chat" role="group" aria-label="Who can chat"><button type="button" data-v="all">Everyone</button><button type="button" data-v="mods">Moderators</button></div></div>
+          <div class="setting"><span class="setting-label">Skipping</span>
+            <div class="seg" data-setting="skip" role="group" aria-label="How skipping works"><button type="button" data-v="instant">Instant</button><button type="button" data-v="vote">Vote</button></div></div>
+          <div class="setting"><span class="setting-label">Wait when someone is loading</span>
+            <div class="seg" data-setting="waitBuffer" role="group" aria-label="Wait for buffering"><button type="button" data-v="on">On</button><button type="button" data-v="off">Off</button></div></div>
+          <div class="setting"><span class="setting-label">Password <span id="pw-state" class="pw-state">Off</span></span>
+            <div class="pw-actions"><button id="pw-set" class="btn btn-ghost btn-sm" type="button">Set password</button><button id="pw-clear" class="btn btn-ghost btn-sm" type="button" hidden>Remove</button></div></div>
+          <div id="kicked-box" class="kicked" hidden>
+            <span class="eyebrow">Removed from this room</span>
+            <ul id="kicked-list" class="kicked-list"></ul>
+          </div>
+        </section>
+        <p id="room-rules" class="panel-note">Everyone can play, pause, seek and change the video.</p>
         <p class="build-tag">Version <span id="build-tag" data-build="__BUILD__"></span></p>
       </section>
     </aside>
@@ -212,6 +243,7 @@
       <div>
         <h2 id="invite-title" class="invite-title">Invite people</h2>
         <p class="invite-sub">Anyone with this link joins room <strong id="invite-code">------</strong>. It works while at least one person is in the room.</p>
+        <p id="invite-pass-note" class="invite-pass" hidden>This room has a password. Send it to people separately.</p>
       </div>
       <button class="icon-btn invite-close" value="close" aria-label="Close">✕</button>
     </header>
@@ -259,6 +291,8 @@
     </div>
   </form>
 </dialog>
+
+<div id="pop-menu" class="row-menu pop-menu" role="menu" hidden></div>
 
 <div id="toast" class="toast" role="status" hidden></div>
 

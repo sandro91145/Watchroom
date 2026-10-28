@@ -17,6 +17,8 @@
   const PEER_PREFIX = 'watchroom-sp91145-v1-';
   const CODE_CHARS = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
   const USER_CONFIG = window.WATCHROOM_CONFIG || {};
+  const YT_KEY = String(USER_CONFIG.youtubeApiKey || '').trim();
+  const DM_PLAYER_ID = String(USER_CONFIG.dailymotionPlayerId || '').trim().replace(/[^\w-]/g, '');
   const PEER_OPTIONS = {
     debug: 1,
     ...(USER_CONFIG.peerServer || {}),
@@ -41,6 +43,22 @@
   };
   const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
 
+  const DEFAULT_SETTINGS = { playback: 'all', adding: 'all', chat: 'all', skip: 'instant', waitBuffer: true };
+  const SETTING_VALUES = { playback: ['all', 'mods'], adding: ['all', 'mods'], chat: ['all', 'mods'], skip: ['instant', 'vote'], waitBuffer: [true, false] };
+  function sanitizeSettings(s) {
+    const out = { ...DEFAULT_SETTINGS };
+    if (s && typeof s === 'object') for (const k of Object.keys(SETTING_VALUES)) if (SETTING_VALUES[k].includes(s[k])) out[k] = s[k];
+    return out;
+  }
+  const idList = (a, max = 200) => (Array.isArray(a) ? a.filter((x) => typeof x === 'string' && x).slice(0, max).map((x) => x.slice(0, 80)) : []);
+
+  // Shared by host and guests: who may do what.
+  const me = () => room.users.find((u) => u.id === myId) || null;
+  const iAmMod = () => { const u = me(); return !!u && u.role !== 'member'; };
+  const votesNeeded = () => Math.floor(Math.max(1, room.users.length) / 2) + 1;
+  const liveVoters = () => (room.votes && room.media && room.votes.mid === room.media.uid
+    ? room.votes.voters.filter((id) => room.users.some((u) => u.id === id)) : []);
+
   // ---------- session state ----------
   let peer = null;
   let isHost = false;
@@ -60,7 +78,11 @@
   let migrating = false;
 
   function emptyRoom() {
-    return { name: '', media: null, playing: false, pos: 0, at: 0, rate: 1, queue: [], users: [], share: null };
+    return {
+      name: '', media: null, playing: false, pos: 0, at: 0, rate: 1, queue: [], users: [], share: null,
+      owner: null, mods: [], settings: { ...DEFAULT_SETTINGS }, pass: null, banned: [], muted: [], allowed: [],
+      votes: null, waiting: null,
+    };
   }
   const hostNow = () => Date.now() + clockOffset;
   function expectedPos(r = room) {
@@ -91,9 +113,11 @@
   function cleanName(n) {
     return String(n || '').replace(/\s+/g, ' ').trim().slice(0, 24) || 'Guest';
   }
+  const SOURCE = { youtube: 'YouTube', video: 'Video file', vimeo: 'Vimeo', twitch: 'Twitch', dailymotion: 'Dailymotion' };
   function mediaLabel(m) {
-    return m.title || (m.kind === 'youtube' ? 'a YouTube video' : 'a video');
+    return m.title || (m.kind === 'video' ? 'a video' : `a ${SOURCE[m.kind] || ''} video`);
   }
+  const fallbackTitle = (m) => (m.kind === 'video' ? 'Video' : `${SOURCE[m.kind] || ''} video`);
   function genCode() {
     let c = '';
     const buf = new Uint32Array(6);
@@ -114,6 +138,79 @@
     toastTimer = setTimeout(() => { t.hidden = true; }, ms);
   }
 
+  // ---------- identity: a signing key that never leaves this browser ----------
+  // Owner and moderator roles are tied to this key, so they survive host handovers and can't be
+  // claimed by whoever happens to be relaying the room: joining means signing a one-time challenge.
+  const ident = { uid: null, pub: null, key: null, ready: null };
+  const enc = new TextEncoder();
+  const b64u = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  function b64uBytes(s) {
+    const bin = atob(String(s).replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((s.length + 3) % 4));
+    return Uint8Array.from(bin, (c) => c.charCodeAt(0));
+  }
+  function randomToken(n = 16) {
+    const a = new Uint8Array(n);
+    crypto.getRandomValues(a);
+    return [...a].map((b) => b.toString(16).padStart(2, '0')).join('');
+  }
+  function idbOpen() {
+    return new Promise((resolve, reject) => {
+      const r = indexedDB.open('watchroom', 1);
+      r.onupgradeneeded = () => r.result.createObjectStore('kv');
+      r.onsuccess = () => resolve(r.result);
+      r.onerror = () => reject(r.error);
+    });
+  }
+  async function idb(mode, fn) {
+    const db = await idbOpen();
+    return new Promise((resolve, reject) => {
+      const req = fn(db.transaction('kv', mode).objectStore('kv'));
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+  async function uidFor(pub) {
+    return b64u(await crypto.subtle.digest('SHA-256', enc.encode(`${pub.x}.${pub.y}`))).slice(0, 16);
+  }
+  ident.ready = (async () => {
+    try {
+      let kp = await idb('readonly', (st) => st.get('identity'));
+      if (!kp || !kp.privateKey || !kp.publicKey) {
+        kp = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign', 'verify']);
+        await idb('readwrite', (st) => st.put(kp, 'identity'));
+      }
+      const jwk = await crypto.subtle.exportKey('jwk', kp.publicKey);
+      ident.pub = { x: jwk.x, y: jwk.y };
+      ident.key = kp.privateKey;
+      ident.uid = await uidFor(ident.pub);
+    } catch { /* no identity in this browser: you join as a regular member */ }
+  })();
+  async function signNonce(nonce) {
+    if (!ident.key) return null;
+    return b64u(await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, ident.key, enc.encode(nonce)));
+  }
+  async function verifyHello(d, nonce) {
+    try {
+      if (!d.pub || typeof d.pub.x !== 'string' || typeof d.pub.y !== 'string' || typeof d.sig !== 'string' || !nonce) return null;
+      const key = await crypto.subtle.importKey('jwk', { kty: 'EC', crv: 'P-256', x: d.pub.x, y: d.pub.y, ext: true },
+        { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']);
+      const ok = await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, key, b64uBytes(d.sig), enc.encode(nonce));
+      return ok ? uidFor(d.pub) : null;
+    } catch { return null; }
+  }
+  async function sha256hex(s) {
+    const d = await crypto.subtle.digest('SHA-256', enc.encode(s));
+    return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, '0')).join('');
+  }
+  async function makePassHash(pw) {
+    const salt = randomToken(16);
+    return { salt, hash: await sha256hex(`${salt}:${pw}`) };
+  }
+  async function passwordMatches(pw) {
+    if (!room.pass) return true;
+    try { return (await sha256hex(`${room.pass.salt}:${String(pw).slice(0, 64)}`)) === room.pass.hash; } catch { return false; }
+  }
+
   // ---------- link parsing ----------
   function parseTime(t) {
     if (!t) return 0;
@@ -126,9 +223,10 @@
   function parseMedia(raw) {
     let s = String(raw || '').trim();
     if (!s) return null;
-    if (/^[\w-]{11}$/.test(s)) {
+    if (/^[\w-]{11}$/.test(s) && /[A-Z0-9_-]/.test(s)) {   // a bare video id ("programming" is a search)
       return { kind: 'youtube', ytId: s, src: `https://www.youtube.com/watch?v=${s}`, start: 0 };
     }
+    if (/\s/.test(s)) return null;                     // words with spaces are a search, not a link
     if (!/^https?:\/\//i.test(s)) s = 'https://' + s;
     let u;
     try { u = new URL(s); } catch { return null; }
@@ -136,6 +234,7 @@
 
     const host = u.hostname.toLowerCase().replace(/^(www|m|music)\./, '');
     const isYT = host === 'youtube.com' || host === 'youtu.be' || host === 'youtube-nocookie.com';
+    // (Vimeo, Twitch and Dailymotion are handled after YouTube below.)
     if (isYT) {
       let id = null;
       if (host === 'youtu.be') id = u.pathname.slice(1).split('/')[0];
@@ -144,11 +243,47 @@
         const m = u.pathname.match(/^\/(?:embed|shorts|live|v)\/([\w-]{11})/);
         if (m) id = m[1];
       }
+      const list = u.searchParams.get('list');
+      if ((!id || !/^[\w-]{11}$/.test(id)) && list && /^[\w-]{10,64}$/.test(list)) {
+        return { kind: 'ytplaylist', list, src: `https://www.youtube.com/playlist?list=${list}` };
+      }
       if (!id || !/^[\w-]{11}$/.test(id)) return null;
       const start = parseTime(u.searchParams.get('t') || u.searchParams.get('start'));
-      return { kind: 'youtube', ytId: id, src: `https://www.youtube.com/watch?v=${id}`, start };
+      return { kind: 'youtube', ytId: id, src: `https://www.youtube.com/watch?v=${id}`, start, inList: !!list };
     }
 
+    if (host === 'vimeo.com' || host === 'player.vimeo.com') {
+      const m = u.pathname.match(/(?:^|\/)(\d{5,12})(?:\/([a-f0-9]{6,20}))?(?:\/|$)/i);
+      if (!m) return null;
+      const hash = m[2] || u.searchParams.get('h') || '';
+      const okHash = /^[a-f0-9]{6,20}$/i.test(hash) ? hash : '';
+      const t = (u.hash.match(/t=([\dhms]+)/) || [])[1];
+      return { kind: 'vimeo', vid: m[1], hash: okHash, src: `https://vimeo.com/${m[1]}${okHash ? '/' + okHash : ''}`, start: parseTime(t), title: '' };
+    }
+
+    if (host === 'twitch.tv' || host === 'player.twitch.tv' || host === 'clips.twitch.tv') {
+      if (host === 'clips.twitch.tv' || /\/clip\//.test(u.pathname)) {
+        return { kind: 'unsupported', reason: "Twitch clips can't be synced. Paste the full broadcast (twitch.tv/videos/…) or use Share a tab." };
+      }
+      const v = u.pathname.match(/^\/videos\/(\d{5,12})/) || (u.searchParams.get('video') || '').match(/^v?(\d{5,12})$/);
+      if (v) return { kind: 'twitch', twVideo: v[1], src: `https://www.twitch.tv/videos/${v[1]}`, start: parseTime(u.searchParams.get('t')), title: `Twitch video ${v[1]}` };
+      const ch = ((u.pathname.match(/^\/([a-z0-9_]{3,25})\/?$/i) || [])[1] || u.searchParams.get('channel') || '').toLowerCase();
+      const reserved = ['directory', 'videos', 'settings', 'search', 'downloads', 'jobs', 'p', 'subscriptions', 'inventory', 'wallet', 'drops'];
+      if (/^[a-z0-9_]{3,25}$/.test(ch) && !reserved.includes(ch)) {
+        return { kind: 'twitch', twChannel: ch, live: true, src: `https://www.twitch.tv/${ch}`, start: 0, title: `${ch} (live on Twitch)` };
+      }
+      return null;
+    }
+
+    if (host === 'dailymotion.com' || host === 'dai.ly' || host === 'geo.dailymotion.com') {
+      const id = (u.pathname.match(/\/video\/([a-z0-9]{5,12})/i) || [])[1]
+        || (host === 'dai.ly' ? (u.pathname.match(/^\/([a-z0-9]{5,12})/i) || [])[1] : null)
+        || u.searchParams.get('video');
+      if (!id || !/^[a-z0-9]{5,12}$/i.test(id)) return null;
+      return { kind: 'dailymotion', dmId: id, src: `https://www.dailymotion.com/video/${id}`, start: parseTime(u.searchParams.get('start')), title: '' };
+    }
+
+    if (!/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(u.hostname) && !/^\d{1,3}(\.\d{1,3}){3}$/.test(u.hostname)) return null;   // needs a real domain
     let file = u.pathname.split('/').pop() || u.hostname;
     try { file = decodeURIComponent(file); } catch { /* keep raw */ }
     return { kind: 'video', src: u.href, start: 0, title: file.slice(0, 200) };
@@ -173,7 +308,180 @@
     return ytApiPromise;
   }
 
+  // =====================================================================
+  //  OTHER SITES — Vimeo, Twitch and Dailymotion players behind one small interface
+  // =====================================================================
+  const EXT_KINDS = ['vimeo', 'twitch', 'dailymotion'];
+  const scriptCache = {};
+  function loadScript(src, isReady) {
+    if (isReady()) return Promise.resolve();
+    if (!scriptCache[src]) {
+      scriptCache[src] = new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = src;
+        s.async = true;
+        s.onload = () => (isReady() ? resolve() : reject(new Error('script loaded without its player')));
+        s.onerror = () => { delete scriptCache[src]; reject(new Error('script failed to load')); };
+        document.head.appendChild(s);
+      });
+    }
+    return scriptCache[src];
+  }
+  function freshExtHost() {
+    const wrap = $('ext-wrap');
+    wrap.textContent = '';
+    const d = document.createElement('div');
+    d.className = 'ext-host';
+    d.id = `ext-${uid()}`;
+    wrap.appendChild(d);
+    return d;
+  }
+  /** Events from another site's player, treated like the YouTube/<video> ones. */
+  function extEvent(type, t) {
+    if (player.kind !== 'ext') return;
+    if (type === 'ended') return onPlayerEnded();
+    if (type === 'play') $('unmute-overlay').hidden = true;
+    if (player.suppressed()) return;
+    if (type === 'play') onLocalPlay(t);
+    else if (type === 'pause') onLocalPause(t);
+    else if (type === 'seek') onLocalSeek(t);
+  }
+  const autoplayBlocked = () => { if (room.playing && !player.errored) $('unmute-overlay').hidden = false; };
+
+  /** Keeps a playback clock between the site's own (sometimes asynchronous) time reports. */
+  function clock0() {
+    return {
+      t: 0, at: 0, playing: false, buffering: false,
+      set(t) { if (typeof t === 'number' && isFinite(t)) { this.t = t; this.at = Date.now(); } },
+      now() { return this.playing && !this.buffering ? this.t + (Date.now() - this.at) / 1000 : this.t; },
+    };
+  }
+
+  function vimeoAdapter() {
+    let p = null;
+    let ready = false;
+    let title = '';
+    const c = clock0();
+    return {
+      async load(m, start) {
+        await loadScript('https://player.vimeo.com/api/player.js', () => window.Vimeo && window.Vimeo.Player);
+        const host = freshExtHost();
+        p = new window.Vimeo.Player(host, { url: m.hash ? `https://vimeo.com/${m.vid}/${m.hash}` : `https://vimeo.com/${m.vid}`, autoplay: false, dnt: true, playsinline: true, width: 640 });
+        p.on('timeupdate', (d) => c.set(d && d.seconds));
+        p.on('play', () => { c.playing = true; extEvent('play', c.now()); });
+        p.on('playing', () => { c.playing = true; c.buffering = false; });
+        p.on('pause', (d) => { c.set(d && d.seconds); c.playing = false; extEvent('pause', c.now()); });
+        p.on('seeked', (d) => { c.set(d && d.seconds); extEvent('seek', c.now()); });
+        p.on('ended', () => { c.playing = false; extEvent('ended'); });
+        p.on('bufferstart', () => { c.buffering = true; });
+        p.on('bufferend', () => { c.buffering = false; });
+        p.on('error', (e) => {
+          if (e && (e.name === 'PrivacyError' || e.name === 'NotFoundError')) showStageError("This Vimeo video can't be played here. It may be private or not allowed on other sites.", m.src);
+        });
+        await p.ready();
+        try { title = await p.getVideoTitle(); } catch { /* untitled */ }
+        if (start > 0.5) { try { await p.setCurrentTime(start); } catch { /* past the end */ } }
+        c.set(start || 0);
+        ready = true;
+      },
+      play() { if (p) p.play().catch(autoplayBlocked); },
+      pause() { if (p) p.pause().catch(() => {}); },
+      seek(t) { c.set(t); if (p) p.setCurrentTime(t).catch(() => {}); },
+      getTime: () => c.now(),
+      isPlaying: () => c.playing,
+      isBuffering: () => c.buffering,
+      hasTime: () => ready,
+      canPlayAt: () => ready && !c.buffering,
+      title: () => title,
+      destroy() { try { if (p) p.destroy(); } catch { /* gone */ } p = null; },
+    };
+  }
+
+  function twitchAdapter() {
+    let p = null;
+    let ready = false;
+    const c = clock0();
+    const hms = (s) => { s = Math.floor(s); return `${Math.floor(s / 3600)}h${Math.floor((s % 3600) / 60)}m${s % 60}s`; };
+    const nowT = () => { try { return p.getCurrentTime() || 0; } catch { return c.now(); } };
+    return {
+      async load(m, start) {
+        await loadScript('https://player.twitch.tv/js/embed/v1.js', () => window.Twitch && window.Twitch.Player);
+        const host = freshExtHost();
+        const opts = { width: '100%', height: '100%', parent: [location.hostname], autoplay: false, muted: false };
+        if (m.twChannel) opts.channel = m.twChannel;
+        else { opts.video = `v${m.twVideo}`; if (start > 1) opts.time = hms(start); }
+        const E = window.Twitch.Player;
+        p = new E(host.id, opts);
+        await new Promise((resolve, reject) => {
+          const t = setTimeout(() => reject(new Error('Twitch player timed out')), 15000);
+          p.addEventListener(E.READY, () => { clearTimeout(t); resolve(); });
+        });
+        p.addEventListener(E.PLAY, () => { c.playing = true; c.buffering = true; extEvent('play', nowT()); });
+        p.addEventListener(E.PLAYING, () => { c.playing = true; c.buffering = false; });
+        p.addEventListener(E.PAUSE, () => { c.playing = false; c.buffering = false; extEvent('pause', nowT()); });
+        p.addEventListener(E.ENDED, () => { c.playing = false; extEvent('ended'); });
+        p.addEventListener(E.SEEK, (d) => extEvent('seek', d && typeof d.position === 'number' ? d.position : nowT()));
+        if (E.PLAYBACK_BLOCKED) p.addEventListener(E.PLAYBACK_BLOCKED, autoplayBlocked);
+        if (E.OFFLINE && m.twChannel) p.addEventListener(E.OFFLINE, () => showStageError(`${m.twChannel} isn't live on Twitch right now.`, m.src));
+        ready = true;
+      },
+      play() { try { p.play(); } catch { /* not ready */ } },
+      pause() { try { p.pause(); } catch { /* not ready */ } },
+      seek(t) { try { p.seek(t); } catch { /* live */ } },
+      getTime: () => (p ? nowT() : 0),
+      isPlaying: () => { try { return !p.isPaused(); } catch { return c.playing; } },
+      isBuffering: () => c.buffering,
+      hasTime: () => ready,
+      canPlayAt: () => ready,
+      title: () => null,
+      destroy() { p = null; $('ext-wrap').textContent = ''; },
+    };
+  }
+
+  function dailymotionAdapter() {
+    let p = null;
+    let ready = false;
+    let title = '';
+    const c = clock0();
+    const take = (s) => { if (s) { c.set(s.videoTime); if (s.videoTitle) title = s.videoTitle; } };
+    return {
+      async load(m, start) {
+        if (!DM_PLAYER_ID) throw Object.assign(new Error('Dailymotion needs a Player ID'), { code: 'dm-config' });
+        await loadScript(`https://geo.dailymotion.com/libs/player/${DM_PLAYER_ID}.js`, () => window.dailymotion && window.dailymotion.createPlayer);
+        const host = freshExtHost();
+        p = await window.dailymotion.createPlayer(host.id, { video: m.dmId, params: { startTime: Math.floor(start || 0), mute: false } });
+        const E = window.dailymotion.events || {};
+        const on = (name, fn) => { if (E[name]) p.on(E[name], fn); };
+        on('VIDEO_TIMECHANGE', take);
+        on('PLAYER_VIDEOCHANGE', take);
+        on('VIDEO_PLAY', (s) => { take(s); c.playing = true; extEvent('play', c.now()); });
+        on('VIDEO_PLAYING', (s) => { take(s); c.playing = true; c.buffering = false; });
+        on('VIDEO_PAUSE', (s) => { take(s); c.playing = false; extEvent('pause', c.now()); });
+        on('VIDEO_SEEKEND', (s) => { take(s); extEvent('seek', c.now()); });
+        on('VIDEO_BUFFERING', () => { c.buffering = true; });
+        on('VIDEO_END', () => { c.playing = false; extEvent('ended'); });
+        on('PLAYER_ERROR', () => showStageError("Dailymotion couldn't play this video.", m.src));
+        try { take(await p.getState()); } catch { /* no state yet */ }
+        c.set(start || 0);
+        ready = true;
+      },
+      play() { if (p) Promise.resolve(p.play()).catch(autoplayBlocked); },
+      pause() { if (p) Promise.resolve(p.pause()).catch(() => {}); },
+      seek(t) { c.set(t); if (p) Promise.resolve(p.seek(t)).catch(() => {}); },
+      getTime: () => c.now(),
+      isPlaying: () => c.playing,
+      isBuffering: () => c.buffering,
+      hasTime: () => ready,
+      canPlayAt: () => ready && !c.buffering,
+      title: () => title || null,
+      destroy() { try { if (p && p.destroy) p.destroy(); } catch { /* gone */ } p = null; },
+    };
+  }
+
+  const ADAPTERS = { vimeo: vimeoAdapter, twitch: twitchAdapter, dailymotion: dailymotionAdapter };
+
   const player = {
+    ext: null,
     media: null,
     kind: null,
     ready: false,
@@ -202,12 +510,39 @@
       if (!media) {
         this.stopYouTube();
         this.stopVideo();
+        this.destroyExt();
         $('yt-wrap').hidden = true;
         $('stage-empty').hidden = false;
         this.kind = null;
         return;
       }
       $('stage-empty').hidden = true;
+
+      if (EXT_KINDS.includes(media.kind)) {
+        this.stopVideo();
+        this.stopYouTube();
+        this.destroyExt();
+        $('yt-wrap').hidden = true;
+        $('ext-wrap').hidden = false;
+        this.kind = 'ext';
+        const adapter = ADAPTERS[media.kind]();
+        this.ext = adapter;
+        this.suppress(3000);
+        try {
+          await adapter.load(media, media.live ? 0 : expectedPos());
+        } catch (e) {
+          if (token !== this.loadToken) return;
+          showStageError(e && e.code === 'dm-config'
+            ? 'Dailymotion videos need a free Player ID set in js/config.js. The README explains how.'
+            : `${SOURCE[media.kind]}'s player couldn't load. Check your connection or ad blocker, then reload.`, media.src);
+          return;
+        }
+        if (token !== this.loadToken) { try { adapter.destroy(); } catch { /* gone */ } return; }
+        this.ready = true;
+        return;
+      }
+      this.destroyExt();
+      $('ext-wrap').hidden = true;
 
       if (media.kind === 'youtube') {
         this.stopVideo();
@@ -230,6 +565,12 @@
         this.loadVideo(media);
         this.ready = true;
       }
+    },
+
+    destroyExt() {
+      if (this.ext) { try { this.ext.destroy(); } catch { /* gone */ } this.ext = null; }
+      $('ext-wrap').textContent = '';
+      $('ext-wrap').hidden = true;
     },
 
     cueYouTube(videoId, start) {
@@ -322,6 +663,7 @@
     },
 
     play() {
+      if (this.kind === 'ext' && this.ext) return this.ext.play();
       if (this.kind === 'youtube' && this.yt) {
         try { this.yt.playVideo(); } catch { /* ignore */ }
       } else if (this.kind === 'video') {
@@ -330,15 +672,21 @@
       }
     },
     pause() {
+      if (this.kind === 'ext' && this.ext) return this.ext.pause();
       if (this.kind === 'youtube' && this.yt) { try { this.yt.pauseVideo(); } catch { /* ignore */ } }
       else if (this.kind === 'video') video.pause();
     },
     seek(t) {
       t = Math.max(0, t);
-      if (this.kind === 'youtube' && this.yt) { try { this.yt.seekTo(t, true); } catch { /* ignore */ } }
+      // Remember our own seeks: on a slow connection they can finish long after we stop expecting them.
+      this.lastSeekTarget = t;
+      this.lastSeekAt = Date.now();
+      if (this.kind === 'ext' && this.ext) this.ext.seek(t);
+      else if (this.kind === 'youtube' && this.yt) { try { this.yt.seekTo(t, true); } catch { /* ignore */ } }
       else if (this.kind === 'video') { try { video.currentTime = t; } catch { /* not seekable yet */ } }
     },
     getTime() {
+      if (this.kind === 'ext' && this.ext) return this.ext.getTime();
       if (this.kind === 'youtube' && this.yt && this.yt.getCurrentTime) {
         try { return this.yt.getCurrentTime() || 0; } catch { return 0; }
       }
@@ -352,21 +700,46 @@
       return -1;
     },
     isPlaying() {
+      if (this.kind === 'ext') return !!(this.ext && this.ext.isPlaying());
       if (this.kind === 'youtube') { const s = this.state(); return s === 1 || s === 3; }
       if (this.kind === 'video') return !video.paused && !video.ended;
       return false;
     },
+    /** Enough is loaded to play from `pos` (used to end a wait-for-buffering pause). */
+    canPlayAt(pos) {
+      if (this.kind === 'video') {
+        if (video.readyState >= 3 && Math.abs(video.currentTime - pos) < 2) return true;
+        const b = video.buffered;
+        for (let i = 0; i < b.length; i++) if (b.start(i) <= pos + 0.5 && b.end(i) >= Math.min(pos + 3, (video.duration || Infinity) - 0.2)) return true;
+        return false;
+      }
+      if (this.kind === 'youtube' && this.yt) {
+        try {
+          const s = this.state();
+          if (s === 1) return true;
+          if (s !== 2) return false;
+          const d = this.yt.getDuration() || 0;
+          const f = this.yt.getVideoLoadedFraction() || 0;
+          return !d || f >= 0.99 || f * d >= pos + 3;
+        } catch { return true; }
+      }
+      if (this.kind === 'ext' && this.ext) return this.ext.canPlayAt(pos);
+      return true;
+    },
     hasTime() {
+      if (this.kind === 'ext') return !!(this.ext && this.ext.hasTime());
       if (this.kind === 'youtube') { const s = this.state(); return s === 1 || s === 2 || s === 3; }
       if (this.kind === 'video') return video.readyState >= 1;
       return false;
     },
     isBuffering() {
+      if (this.kind === 'ext') return !!(this.ext && this.ext.isBuffering());
       if (this.kind === 'youtube') return this.state() === 3;
       if (this.kind === 'video') return video.readyState < 3 && !video.paused;
       return false;
     },
     title() {
+      if (this.kind === 'ext') return this.ext ? this.ext.title() : null;
       if (this.kind === 'youtube' && this.yt && this.yt.getVideoData) {
         try { const d = this.yt.getVideoData(); return d && d.title; } catch { return null; }
       }
@@ -398,8 +771,12 @@
     player.errored = true;
     $('stage-error-text').textContent = text;
     const a = $('stage-error-link');
-    if (ytLink && /^https:\/\/www\.youtube\.com\//.test(ytLink)) { a.href = ytLink; a.hidden = false; }
-    else a.hidden = true;
+    if (ytLink && /^https:\/\//.test(ytLink)) {
+      a.href = ytLink;
+      const kind = player.media && player.media.kind;
+      a.textContent = kind && SOURCE[kind] && kind !== 'video' ? `Open on ${SOURCE[kind]}` : 'Open the original';
+      a.hidden = false;
+    } else a.hidden = true;
     $('stage-error').hidden = false;
     $('unmute-overlay').hidden = true;
   }
@@ -428,8 +805,9 @@
     if (!player.ready || player.errored || !room.media || player.media.uid !== room.media.uid) return;
     const exp = expectedPos();
     const cur = player.getTime();
+    const live = !!room.media.live;
     if (room.playing) {
-      if ((fresh && Math.abs(cur - exp) > 0.5) || Math.abs(cur - exp) > DRIFT) {
+      if (!live && ((fresh && Math.abs(cur - exp) > 0.5) || Math.abs(cur - exp) > DRIFT)) {
         player.suppress(); player.seek(exp); player.lastFix = Date.now();
       }
       if (!player.isPlaying()) {
@@ -439,7 +817,7 @@
     } else {
       if (player.isPlaying()) { player.suppress(); player.pause(); }
       if (fresh && player.kind === 'youtube' && !player.hasTime()) return;
-      if (Math.abs(cur - room.pos) > 0.5) {
+      if (!live && Math.abs(cur - room.pos) > 0.5) {
         player.suppress();
         player.seek(room.pos);
         if (player.kind === 'youtube') {
@@ -455,7 +833,7 @@
   function checkBlockedSoon() {
     const mid = room.media && room.media.uid;
     setTimeout(() => {
-      if (room.share || !room.playing || !room.media || room.media.uid !== mid || player.errored || !player.ready) return;
+      if (room.share || room.waiting || !room.playing || !room.media || room.media.uid !== mid || player.errored || !player.ready) return;
       if (!player.isPlaying()) $('unmute-overlay').hidden = false;
     }, 2200);
   }
@@ -487,18 +865,19 @@
     sendAction({ type: 'pause', pos: t });
   }
   function onLocalSeek(t) {
-    if (!room.media) return;
+    if (!room.media || room.media.live) return;
+    if (Date.now() - (player.lastSeekAt || 0) < 20000 && Math.abs(t - player.lastSeekTarget) < 1.5) return;   // our own seek landing
     if (Math.abs(t - expectedPos()) < DRIFT + 0.5) return;
     sendAction({ type: 'seek', pos: t });
   }
   function onPlayerEnded() {
     if (!isHost || !room.media || !room.playing) return;
-    handleAction(myId, { type: 'next', mid: room.media.uid, auto: true });
+    handleAction(myId, { type: 'next', mid: room.media.uid, auto: true, pos: player.getTime() });
   }
 
   const reportedTitles = new Set();
   function tick() {
-    if (room.share) return;
+    if (room.share || room.waiting || (room.media && room.media.live)) return;
     if (!player.ready || player.errored || !room.media || !player.media || player.media.uid !== room.media.uid) return;
     const now = Date.now();
     const t = player.getTime();
@@ -539,6 +918,49 @@
     }
   }
   setInterval(tick, 500);
+
+  // ---------- wait for buffering (everyone) ----------
+  let bufSince = 0;
+  let bufReported = false;
+  let bufReportedAt = 0;
+  let bufMid = null;
+  let lastResume = 0;
+  let wasPlaying = false;
+
+  function reportBuffer(on) {
+    bufReported = on;
+    bufReportedAt = Date.now();
+    bufMid = room.media ? room.media.uid : null;
+    if (isHost) onBufferReport(myId, on, bufMid);
+    else if (hostConn && hostConn.open) { try { hostConn.send({ t: 'buffer', on, mid: bufMid }); } catch { /* ignore */ } }
+  }
+
+  setInterval(() => {
+    if (!myId || !room.media || room.share || room.media.live || !room.settings.waitBuffer) {
+      if (bufReported) reportBuffer(false);
+      bufSince = 0;
+      return;
+    }
+    if (bufReported && bufMid !== room.media.uid) bufReported = false;   // a new video voids the old report
+    const now = Date.now();
+    if (room.playing && !wasPlaying) lastResume = now;
+    wasPlaying = room.playing;
+    const loading = !player.ready && !player.errored && player.media && player.media.uid === room.media.uid;
+    const stalled = player.ready && !player.errored && player.isBuffering();
+    if (room.playing) {
+      if ((loading || stalled) && now - lastResume > 1500) {
+        if (!bufSince) bufSince = now;
+        if (!bufReported && now - bufSince > 700) reportBuffer(true);
+      } else {
+        bufSince = 0;
+        if (bufReported) reportBuffer(false);
+      }
+    } else if (bufReported) {
+      // The room paused for us: say we're ready once we can play from the paused spot.
+      const ready = player.errored || (player.ready && (player.canPlayAt(room.pos) || (now - bufReportedAt > 6000 && !player.isBuffering())));
+      if (ready) { bufSince = 0; reportBuffer(false); }
+    }
+  }, 300);
 
   // =====================================================================
   //  TAB SHARING — the sharer streams a tab straight to every viewer
@@ -907,16 +1329,46 @@
     return g ? g.name : 'Someone';
   }
 
+  function roleOfUid(u) {
+    if (!u) return 'member';
+    if (u === room.owner) return 'owner';
+    return room.mods.includes(u) ? 'mod' : 'member';
+  }
+  function uidOfPeer(id) {
+    if (id === myId) return ident.uid;
+    const g = guests.get(id);
+    return (g && g.uid) || null;
+  }
+  const roleOfPeer = (id) => roleOfUid(uidOfPeer(id));
+
   function rebuildUsers() {
-    const list = [{ id: myId, name: myName, host: true }];
+    const entry = (id, name, u, host, anonMuted) => ({
+      id, name, host, uid: u || null, role: roleOfUid(u), muted: !!((u && room.muted.includes(u)) || anonMuted),
+    });
+    const list = [entry(myId, myName, ident.uid, true, false)];
     [...guests.entries()]
       .filter(([, g]) => g.ready)
       .sort((a, b) => a[1].joined - b[1].joined)
-      .forEach(([id, g]) => list.push({ id, name: g.name, host: false }));
+      .forEach(([id, g]) => list.push(entry(id, g.name, g.uid, false, g.mutedAnon)));
     room.users = list;
   }
 
+  /** A message for one person, from the room (refusals, warnings). */
+  function tellPeer(id, text) {
+    if (id === myId) return toast(text, 4000);
+    const g = guests.get(id);
+    if (g && g.conn.open) { try { g.conn.send({ t: 'notice', text }); } catch { /* gone */ } }
+  }
+  /** Puts someone's player back in line after a refused action. */
+  function resyncPeer(id) {
+    if (id === myId) { render(); syncPlayer(); return; }
+    const g = guests.get(id);
+    if (g && g.conn.open) { try { g.conn.send({ t: 'state', room }); } catch { /* gone */ } }
+  }
+
   function setMedia(m) {
+    room.votes = null;
+    room.waiting = null;
     room.media = m;
     room.pos = m.start || 0;
     room.at = hostNow();
@@ -925,11 +1377,14 @@
 
   function hostMediaFrom(a, by) {
     const m = parseMedia(a && a.media && a.media.raw);
-    if (!m) return null;
+    if (!m || m.kind === 'unsupported' || m.kind === 'ytplaylist') return null;
+    if (m.kind === 'dailymotion' && !DM_PLAYER_ID) return null;
     m.uid = uid();
     m.by = cleanName(by);
-    m.titleSet = m.kind === 'video';
-    if (m.kind === 'youtube') fetchTitle(m);
+    m.titleSet = m.kind === 'video' || m.kind === 'twitch';
+    const given = a.media && typeof a.media.title === 'string' ? a.media.title.trim() : '';
+    if (given) { m.title = given.slice(0, 200); m.titleSet = true; }
+    else if (['youtube', 'vimeo', 'dailymotion'].includes(m.kind)) fetchTitle(m);
     return m;
   }
 
@@ -941,13 +1396,32 @@
 
     if (['play', 'pause', 'seek'].includes(a.type) && (!cur || a.mid !== cur.uid)) return;
 
+    // Who may do this?
+    const mod = roleOfPeer(from) !== 'member';
+    const S = room.settings;
+    const refuse = (text) => { tellPeer(from, text); resyncPeer(from); };
+    const PLAYBACK = ['play', 'pause', 'seek', 'load', 'loadMany', 'playNow', 'remove', 'up', 'shareStart'];
+    if (PLAYBACK.includes(a.type) && S.playback === 'mods' && !mod) return refuse('Only moderators can control playback in this room.');
+    if ((a.type === 'enqueue' || a.type === 'enqueueMany') && S.adding === 'mods' && !mod) return refuse('Only moderators can add videos in this room.');
+    if (a.type === 'next') {
+      if (a.auto && from !== myId) return;
+      if (!a.auto && !mod) {
+        if (S.playback === 'mods') return refuse('Only moderators can skip in this room.');
+        if (S.skip === 'vote') return castVote(from, who);
+      }
+    }
+    if (MOD_ACTIONS.includes(a.type)) {
+      if (!mod) return refuse('Only moderators can do that.');
+      return modAction(from, who, a);
+    }
+
     switch (a.type) {
       case 'play':
-        room.pos = pos; room.at = hostNow(); room.playing = true;
+        room.pos = pos; room.at = hostNow(); room.playing = true; room.waiting = null; buffering.clear();
         systemMsg(`${who} pressed play`);
         break;
       case 'pause':
-        room.pos = pos; room.at = hostNow(); room.playing = false;
+        room.pos = pos; room.at = hostNow(); room.playing = false; room.waiting = null;
         systemMsg(`${who} paused at ${fmt(pos)}`);
         break;
       case 'seek':
@@ -972,17 +1446,20 @@
       }
       case 'next': {
         if (a.mid && (!cur || a.mid !== cur.uid)) return;
-        if (!a.auto) room.share = null;
-        const next = room.queue.shift();
-        if (next) {
-          setMedia(next);
-          if (!a.auto) systemMsg(`${who} skipped to ${mediaLabel(next)}`);
-        } else if (a.auto && cur) {
-          room.playing = false; room.pos = pos || room.pos; room.at = hostNow();
-        } else {
-          room.media = null; room.playing = false; room.pos = 0; room.at = hostNow();
-          if (cur) systemMsg(`${who} cleared the player`);
-        }
+        doNext(who, !!a.auto, pos);
+        break;
+      }
+      case 'loadMany':
+      case 'enqueueMany': {
+        const items = Array.isArray(a.items) ? a.items.slice(0, MAX_QUEUE) : [];
+        const ms = items.map((it) => hostMediaFrom({ media: it }, who)).filter(Boolean);
+        if (!ms.length) return;
+        const total = ms.length;
+        if (a.type === 'loadMany' || !room.media) { room.share = null; setMedia(ms.shift()); }
+        const room_left = Math.max(0, MAX_QUEUE - room.queue.length);
+        const added = ms.slice(0, room_left);
+        room.queue = a.type === 'loadMany' ? [...added, ...room.queue].slice(0, MAX_QUEUE) : [...room.queue, ...added];
+        systemMsg(`${who} added ${total} videos from a playlist`);
         break;
       }
       case 'playNow': {
@@ -1022,7 +1499,200 @@
     broadcastState();
   }
 
-  async function fetchTitle(m) {
+  function doNext(who, auto, pos) {
+    const cur = room.media;
+    if (!auto) room.share = null;
+    const next = room.queue.shift();
+    if (next) {
+      setMedia(next);
+      if (!auto) systemMsg(`${who} skipped to ${mediaLabel(next)}`);
+    } else if (auto && cur) {
+      room.playing = false; room.pos = pos || room.pos; room.at = hostNow();
+    } else {
+      room.votes = null;
+      room.media = null; room.playing = false; room.pos = 0; room.at = hostNow();
+      if (cur) systemMsg(`${who} cleared the player`);
+    }
+  }
+
+  function castVote(from, who) {
+    const cur = room.media;
+    if (!cur) return;
+    if (!room.votes || room.votes.mid !== cur.uid) room.votes = { mid: cur.uid, voters: [] };
+    if (!room.votes.voters.includes(from)) {
+      room.votes.voters.push(from);
+      systemMsg(`${who} voted to skip (${liveVoters().length}/${votesNeeded()})`);
+    }
+    if (!checkVotes()) broadcastState();
+  }
+  /** Skips when a majority of the people here voted. Returns true if it skipped (and broadcast). */
+  function checkVotes() {
+    if (!room.votes || !room.media || room.votes.mid !== room.media.uid) return false;
+    if (liveVoters().length < votesNeeded()) return false;
+    systemMsg('The vote passed, skipping');
+    doNext('The room', false, 0);
+    broadcastState();
+    return true;
+  }
+
+  // ---------- wait for buffering (host) ----------
+  const buffering = new Map();      // peer id -> when they started loading
+  const bufferIgnore = new Map();   // peer id -> don't wait for them again before this time
+  const bufferStrikes = new Map();  // peer id -> times they made the room wait recently
+  let waitSince = 0;
+  const WAIT_LIMIT = 12000;
+
+  function onBufferReport(from, on, mid) {
+    if (!room.media || mid !== room.media.uid) return;
+    if (!on) buffering.delete(from);
+    else if (room.settings.waitBuffer && !room.share && !room.media.live && (bufferIgnore.get(from) || 0) < Date.now()) buffering.set(from, Date.now());
+    evaluateWait();
+  }
+  function evaluateWait() {
+    for (const id of [...buffering.keys()]) if (!room.users.some((u) => u.id === id)) buffering.delete(id);
+    if (buffering.size && room.playing && !room.waiting) {
+      // Someone who keeps falling behind stops holding the room up for a minute.
+      const now = Date.now();
+      for (const id of [...buffering.keys()]) {
+        const recent = (bufferStrikes.get(id) || []).filter((t) => now - t < 60000);
+        recent.push(now);
+        bufferStrikes.set(id, recent);
+        if (recent.length > 3) {
+          buffering.delete(id);
+          bufferIgnore.set(id, now + 60000);
+          bufferStrikes.delete(id);
+          tellPeer(id, "Your connection keeps falling behind, so the room won't wait for you for a minute.");
+          systemMsg(`Not waiting for ${nameOf(id)} for a minute: their connection keeps falling behind`);
+        }
+      }
+    }
+    const names = [...buffering.keys()].map(nameOf);
+    if (names.length && room.playing && !room.waiting) {
+      room.pos = expectedPos(); room.at = hostNow(); room.playing = false; room.waiting = names; waitSince = Date.now();
+      broadcastState();
+    } else if (room.waiting) {
+      if (!names.length) resumeAfterWait();
+      else if (names.join('|') !== room.waiting.join('|')) { room.waiting = names; broadcastState(); }
+    }
+  }
+  function resumeAfterWait() {
+    room.waiting = null;
+    room.playing = true;
+    room.at = hostNow();
+    broadcastState();
+  }
+  setInterval(() => {
+    if (!isHost || !room.waiting || Date.now() - waitSince < WAIT_LIMIT) return;
+    for (const id of buffering.keys()) bufferIgnore.set(id, Date.now() + 30000);
+    buffering.clear();
+    systemMsg(`Not waiting any longer for ${room.waiting.join(', ')}`);
+    resumeAfterWait();
+  }, 1000);
+
+  const MOD_ACTIONS = ['setting', 'setPassword', 'clearPassword', 'kick', 'unban', 'mute', 'unmute', 'mod', 'unmod'];
+  const SETTING_TEXT = {
+    playback: { all: 'everyone can control playback', mods: 'only moderators can control playback' },
+    adding: { all: 'everyone can add videos', mods: 'only moderators can add videos' },
+    chat: { all: 'everyone can chat', mods: 'only moderators can chat' },
+    skip: { instant: 'skipping is instant', vote: 'skipping needs a vote' },
+    waitBuffer: { true: 'the room waits for anyone loading', false: "the room doesn't wait for loading" },
+  };
+
+  async function modAction(from, who, a) {
+    const actor = roleOfPeer(from);
+    const target = a.target ? room.users.find((u) => u.id === a.target) : null;
+    // Owners act on anyone but themselves; moderators act on regular members only.
+    const canTouch = target && target.id !== from && target.role !== 'owner' && (actor === 'owner' || target.role === 'member');
+    switch (a.type) {
+      case 'setting': {
+        if (!SETTING_VALUES[a.key] || !SETTING_VALUES[a.key].includes(a.value)) return;
+        room.settings = { ...room.settings, [a.key]: a.value };
+        if (a.key === 'skip') room.votes = null;
+        if (a.key === 'waitBuffer' && !a.value) { buffering.clear(); if (room.waiting) resumeAfterWait(); }
+        systemMsg(`${who} changed the rules: ${SETTING_TEXT[a.key][String(a.value)]}`);
+        break;
+      }
+      case 'setPassword': {
+        const pw = String(a.password || '').slice(0, 64);
+        if (!pw) return;
+        room.pass = await makePassHash(pw);
+        // Everyone already inside can come back without typing it.
+        room.allowed = [...new Set(room.users.map((u) => u.uid).filter(Boolean))].slice(-200);
+        systemMsg(`${who} set a room password`);
+        break;
+      }
+      case 'clearPassword':
+        if (!room.pass) return;
+        room.pass = null;
+        systemMsg(`${who} removed the room password`);
+        break;
+      case 'kick': {
+        if (!canTouch) return tellPeer(from, "You can't remove that person.");
+        if (target.uid && !room.banned.some((b) => b.uid === target.uid)) room.banned.push({ uid: target.uid, name: target.name });
+        if (target.uid) room.allowed = room.allowed.filter((x) => x !== target.uid);
+        systemMsg(`${who} removed ${target.name} from the room`);
+        if (target.id === myId) {
+          // The person relaying the room was removed: hand the room on and leave.
+          broadcastState();
+          setTimeout(() => leaveWithNotice('A moderator removed you from this room.'), 300);
+          return;
+        }
+        removePeer(target.id, 'kicked');
+        break;
+      }
+      case 'unban': {
+        const b = room.banned.find((x) => x.uid === a.uid);
+        if (!b) return;
+        room.banned = room.banned.filter((x) => x.uid !== a.uid);
+        systemMsg(`${who} let ${b.name} back in`);
+        break;
+      }
+      case 'mute':
+      case 'unmute': {
+        if (!canTouch) return tellPeer(from, "You can't mute that person.");
+        const on = a.type === 'mute';
+        if (target.uid) room.muted = on ? [...new Set([...room.muted, target.uid])] : room.muted.filter((x) => x !== target.uid);
+        else { const g = guests.get(target.id); if (g) g.mutedAnon = on; }
+        systemMsg(`${who} ${on ? 'muted' : 'unmuted'} ${target.name}`);
+        break;
+      }
+      case 'mod':
+      case 'unmod': {
+        if (actor !== 'owner') return tellPeer(from, 'Only the room owner can choose moderators.');
+        if (!target || target.role === 'owner') return;
+        if (!target.uid) return tellPeer(from, `${target.name}'s browser can't hold a role. They need a recent Chrome, Edge, Firefox or Safari.`);
+        const on = a.type === 'mod';
+        room.mods = on ? [...new Set([...room.mods, target.uid])] : room.mods.filter((x) => x !== target.uid);
+        systemMsg(on ? `${who} made ${target.name} a moderator` : `${target.name} is no longer a moderator`);
+        break;
+      }
+      default:
+        return;
+    }
+    broadcastState();
+  }
+
+  function removePeer(id, reason) {
+    const g = guests.get(id);
+    if (!g) return;
+    try { g.conn.send({ t: 'denied', reason }); } catch { /* gone */ }
+    guests.delete(id);
+    if (room.share && room.share.peer === id) room.share = null;
+    setTimeout(() => { try { g.conn.close(); } catch { /* ignore */ } }, 400);
+  }
+
+  // Look titles up a few at a time (a playlist can add a hundred at once).
+  const titleQueue = [];
+  let titlesActive = 0;
+  function fetchTitle(m) { titleQueue.push(m); pumpTitles(); }
+  function pumpTitles() {
+    while (titlesActive < 3 && titleQueue.length) {
+      const m = titleQueue.shift();
+      titlesActive++;
+      fetchTitleNow(m).finally(() => { titlesActive--; pumpTitles(); });
+    }
+  }
+  async function fetchTitleNow(m) {
     try {
       const r = await fetch('https://noembed.com/embed?url=' + encodeURIComponent(m.src));
       const j = await r.json();
@@ -1067,7 +1737,9 @@
 
   function onGuestConnection(conn) {
     conn.on('open', () => {
-      guests.set(conn.peer, { conn, name: 'Guest', lastSeen: Date.now(), joined: Date.now(), ready: false });
+      const nonce = `${randomToken(16)}:${code}`;
+      guests.set(conn.peer, { conn, name: 'Guest', lastSeen: Date.now(), joined: Date.now(), ready: false, nonce });
+      try { conn.send({ t: 'challenge', nonce }); } catch { /* closed */ }
     });
     conn.on('data', (d) => {
       if (!d || typeof d !== 'object') return;
@@ -1076,13 +1748,9 @@
       g.lastSeen = Date.now();
       switch (d.t) {
         case 'hello':
-          if (g.ready) return;
-          g.name = cleanName(d.name);
-          g.ready = true;
-          rebuildUsers();
-          conn.send({ t: 'welcome', you: conn.peer, chat: chat.slice(-100) });
-          systemMsg(`${g.name} joined`);
-          broadcastState();
+          if (g.ready || g.checking) return;
+          g.checking = true;
+          admitGuest(conn, g, d);
           break;
         case 'ping':
           conn.send({ t: 'pong', c: d.c, h: Date.now() });
@@ -1090,13 +1758,15 @@
         case 'peek':
           // A lobby checking who's here. Answer and hang up; it never joins.
           if (g.ready) return;
-          conn.send({
-            t: 'peekInfo',
-            name: room.name,
-            users: room.users.map((u) => ({ name: u.name })),
-            now: room.share ? '' : (room.media ? (room.media.title || '') : ''),
-            share: !!room.share,
-          });
+          conn.send(room.pass
+            ? { t: 'peekInfo', name: room.name, private: true, count: room.users.length }
+            : {
+              t: 'peekInfo',
+              name: room.name,
+              users: room.users.map((u) => ({ name: u.name })),
+              now: room.share ? '' : (room.media ? (room.media.title || '') : ''),
+              share: !!room.share,
+            });
           guests.delete(conn.peer);
           setTimeout(() => { try { conn.close(); } catch { /* ignore */ } }, 800);
           break;
@@ -1105,11 +1775,20 @@
           break;
         case 'chat': {
           const text = String(d.text || '').trim().slice(0, 400);
-          if (g.ready && text) pushChat({ from: conn.peer, name: g.name, text, ts: Date.now() });
+          if (!g.ready || !text) break;
+          const why = chatBlocked(conn.peer);
+          if (why) { tellPeer(conn.peer, why); break; }
+          pushChat({ from: conn.peer, name: g.name, text, ts: Date.now() });
           break;
         }
         case 'title':
           if (typeof d.title === 'string' && d.title) setTitle(d.mid, d.title);
+          break;
+        case 'buffer':
+          if (g.ready) onBufferReport(conn.peer, !!d.on, d.mid);
+          break;
+        case 'prove':
+          if (g.ready && !g.uid) upgradeGuest(conn, g, d);
           break;
         case 'bye':
           dropGuest(conn.peer);
@@ -1122,6 +1801,45 @@
     conn.on('error', () => dropGuest(conn.peer));
   }
 
+  async function admitGuest(conn, g, d) {
+    const u = await verifyHello(d, g.nonce);
+    if (guests.get(conn.peer) !== g) return;           // left while we checked
+    if (u && room.banned.some((b) => b.uid === u)) return removePeer(conn.peer, 'kicked');
+    const trusted = u && (u === room.owner || room.mods.includes(u) || room.allowed.includes(u));
+    if (room.pass && !trusted) {
+      if (!d.pass) return removePeer(conn.peer, 'password');
+      if (!(await passwordMatches(d.pass))) return removePeer(conn.peer, 'wrong-password');
+      if (guests.get(conn.peer) !== g) return;
+    }
+    g.uid = u;
+    g.name = cleanName(d.name);
+    g.ready = true;
+    g.checking = false;
+    if (u && !room.allowed.includes(u)) room.allowed = [...room.allowed, u].slice(-200);
+    rebuildUsers();
+    conn.send({ t: 'welcome', you: conn.peer, chat: chat.slice(-100) });
+    systemMsg(`${g.name} joined`);
+    broadcastState();
+  }
+
+  /** Someone who joined before our challenge reached them proves their identity afterwards. */
+  async function upgradeGuest(conn, g, d) {
+    const u = await verifyHello(d, g.nonce);
+    if (!u || guests.get(conn.peer) !== g || g.uid) return;
+    if (room.banned.some((b) => b.uid === u)) { removePeer(conn.peer, 'kicked'); broadcastState(); return; }
+    g.uid = u;
+    if (!room.allowed.includes(u)) room.allowed = [...room.allowed, u].slice(-200);
+    broadcastState();
+  }
+
+  /** Why this person can't chat right now, or null if they can. */
+  function chatBlocked(id) {
+    const u = room.users.find((x) => x.id === id);
+    if (u && u.muted) return "You're muted in this room.";
+    if (room.settings.chat === 'mods' && roleOfPeer(id) === 'member') return 'Only moderators can chat right now.';
+    return null;
+  }
+
   function dropGuest(id) {
     const g = guests.get(id);
     if (!g) return;
@@ -1130,7 +1848,10 @@
     if (g.ready) {
       systemMsg(`${g.name} left`);
       if (room.share && room.share.peer === id) room.share = null;
-      broadcastState();
+      rebuildUsers();
+      buffering.delete(id);
+      if (room.waiting) evaluateWait();
+      if (!checkVotes()) broadcastState();
     }
   }
 
@@ -1181,13 +1902,78 @@
       lastPong = Date.now();
       pongSamples = [];
       migrating = false;
-      conn.send({ t: 'hello', name: myName });
-      for (let i = 0; i < 4; i++) setTimeout(sendPing, 150 * i);
+      helloSent = false;
+      clearTimeout(helloTimer);
+      // Rooms on an older version never send a challenge; say hello anyway after a moment.
+      helloTimer = setTimeout(() => sendHello(null), 4000);
       setConnected(true);
     });
     conn.on('data', onHostData);
     conn.on('close', () => { if (hostConn === conn) onHostLost(); });
     conn.on('error', () => { if (hostConn === conn) onHostLost(); else fail('error'); });
+  }
+
+  let helloSent = false;
+  let helloTimer = null;
+  let joinPassword = '';
+  let welcomed = false;
+  let deniedReason = null;
+  let lastJoinOpts = {};
+
+  async function sendHello(nonce) {
+    if (helloSent || !hostConn) return;
+    helloSent = true;
+    clearTimeout(helloTimer);
+    const conn = hostConn;
+    await ident.ready;
+    let sig = null;
+    try { if (nonce) sig = await signNonce(nonce); } catch { /* sign without a key */ }
+    if (!conn.open) return;
+    conn.send({ t: 'hello', name: myName, pub: ident.pub, sig, pass: joinPassword || undefined });
+    for (let i = 0; i < 4; i++) setTimeout(sendPing, 150 * i);
+  }
+
+  async function sendProof(nonce) {
+    const conn = hostConn;
+    await ident.ready;
+    let sig = null;
+    try { sig = await signNonce(nonce); } catch { return; }
+    if (sig && conn && conn.open) conn.send({ t: 'prove', pub: ident.pub, sig });
+  }
+
+  function handleDenied(reason) {
+    if (deniedReason) return;
+    deniedReason = reason;
+    const c = hostConn;
+    hostConn = null;
+    try { if (c) c.close(); } catch { /* ignore */ }
+    const wasInside = welcomed;
+    if (wasInside) {
+      return leaveWithNotice(reason === 'kicked' ? 'A moderator removed you from this room.' : 'This room now needs a password.');
+    }
+    try { if (peer) peer.destroy(); } catch { /* ignore */ }
+    peer = null;
+    if (reason === 'kicked') return lobbyError("You can't join this room: a moderator removed you from it.");
+    const roomCode = code;
+    (async () => {
+      const pw = await ask({
+        title: 'Password needed',
+        label: reason === 'wrong-password' ? "That password didn't work. Try again:" : `Room ${roomCode} is private. Enter its password:`,
+        ok: 'Join', type: 'password', maxLength: 64,
+      });
+      if (!pw) return lobbyError('This room needs a password to join.');
+      setLobbyBusy(true);
+      startGuest(roomCode, { ...lastJoinOpts, password: pw });
+    })();
+  }
+
+  function leaveWithNotice(text) {
+    try { sessionStorage.setItem('watchroom-notice', text); } catch { /* ignore */ }
+    saveSnapshot();
+    leaving = true;
+    stopLocalShare();
+    try { if (peer) peer.destroy(); } catch { /* ignore */ }
+    location.href = location.pathname;
   }
 
   function sendPing() {
@@ -1197,9 +1983,21 @@
   function onHostData(d) {
     if (!d || typeof d !== 'object') return;
     switch (d.t) {
+      case 'challenge':
+        if (typeof d.nonce !== 'string') break;
+        if (!helloSent) sendHello(d.nonce.slice(0, 200));
+        else sendProof(d.nonce.slice(0, 200));    // the challenge came late: prove who we are now
+        break;
       case 'welcome':
+        welcomed = true;
         chat = Array.isArray(d.chat) ? d.chat.slice(-MAX_CHAT) : [];
         renderAllChat();
+        break;
+      case 'denied':
+        handleDenied(['kicked', 'password', 'wrong-password'].includes(d.reason) ? d.reason : 'kicked');
+        break;
+      case 'notice':
+        if (typeof d.text === 'string') toast(d.text.slice(0, 200), 4000);
         break;
       case 'state':
         if (d.room && typeof d.room === 'object') {
@@ -1238,7 +2036,7 @@
     if (!m || typeof m !== 'object') return null;
     const out = {
       uid: String(m.uid || '').slice(0, 40),
-      kind: m.kind === 'youtube' ? 'youtube' : 'video',
+      kind: SOURCE[m.kind] ? m.kind : 'video',
       src: String(m.src || ''),
       ytId: typeof m.ytId === 'string' && /^[\w-]{11}$/.test(m.ytId) ? m.ytId : null,
       title: typeof m.title === 'string' ? m.title.slice(0, 200) : '',
@@ -1248,10 +2046,36 @@
     };
     if (!/^https?:\/\//i.test(out.src)) return null;
     if (out.kind === 'youtube' && !out.ytId) return null;
+    if (out.kind === 'vimeo') {
+      out.vid = /^\d{5,12}$/.test(m.vid) ? m.vid : null;
+      out.hash = /^[a-f0-9]{6,20}$/i.test(m.hash || '') ? m.hash : '';
+      if (!out.vid) return null;
+    }
+    if (out.kind === 'twitch') {
+      out.twVideo = /^\d{5,12}$/.test(m.twVideo || '') ? m.twVideo : null;
+      out.twChannel = /^[a-z0-9_]{3,25}$/.test(m.twChannel || '') ? m.twChannel : null;
+      if (!out.twVideo && !out.twChannel) return null;
+      out.live = !!out.twChannel;
+    }
+    if (out.kind === 'dailymotion') {
+      out.dmId = /^[a-z0-9]{5,12}$/i.test(m.dmId || '') ? m.dmId : null;
+      if (!out.dmId) return null;
+    }
     return out;
   }
   function sanitizeRoom(r) {
     return {
+      owner: typeof r.owner === 'string' ? r.owner.slice(0, 32) : null,
+      mods: idList(r.mods, 50),
+      settings: sanitizeSettings(r.settings),
+      pass: r.pass && typeof r.pass.salt === 'string' && typeof r.pass.hash === 'string'
+        ? { salt: r.pass.salt.slice(0, 64), hash: r.pass.hash.slice(0, 128) } : null,
+      banned: Array.isArray(r.banned)
+        ? r.banned.filter((b) => b && typeof b.uid === 'string').slice(0, 100).map((b) => ({ uid: b.uid.slice(0, 32), name: cleanName(b.name) })) : [],
+      muted: idList(r.muted, 100),
+      allowed: idList(r.allowed, 200),
+      votes: r.votes && typeof r.votes.mid === 'string' ? { mid: r.votes.mid.slice(0, 40), voters: idList(r.votes.voters, 100) } : null,
+      waiting: Array.isArray(r.waiting) ? r.waiting.slice(0, 20).map(cleanName) : null,
       name: cleanRoomName(r.name),
       media: sanitizeMedia(r.media),
       playing: !!r.playing,
@@ -1260,7 +2084,12 @@
       rate: Number(r.rate) || 1,
       queue: Array.isArray(r.queue) ? r.queue.slice(0, MAX_QUEUE).map(sanitizeMedia).filter(Boolean) : [],
       users: Array.isArray(r.users)
-        ? r.users.slice(0, 100).map((u) => ({ id: String(u && u.id || ''), name: cleanName(u && u.name), host: !!(u && u.host) }))
+        ? r.users.slice(0, 100).map((u) => ({
+          id: String(u && u.id || ''), name: cleanName(u && u.name), host: !!(u && u.host),
+          uid: u && typeof u.uid === 'string' ? u.uid.slice(0, 32) : null,
+          role: u && (u.role === 'owner' || u.role === 'mod') ? u.role : 'member',
+          muted: !!(u && u.muted),
+        }))
         : [],
       share: r.share && typeof r.share === 'object' && typeof r.share.peer === 'string'
         ? { peer: r.share.peer.slice(0, 80), name: cleanName(r.share.name), sid: String(r.share.sid || '').slice(0, 40) }
@@ -1276,13 +2105,16 @@
   }, 3000);
 
   function onHostLost() {
-    if (leaving || isHost || migrating) return;
+    if (leaving || isHost || migrating || deniedReason) return;
     migrating = true;
     if (hostConn) { try { hostConn.close(); } catch { /* ignore */ } hostConn = null; }
     setConnected(false, 'Host left · reconnecting');
 
     const lastRoom = room;
-    const others = lastRoom.users.filter((u) => !u.host);
+    // Owner first, then moderators, then whoever has been here longest.
+    const weight = (u) => (u.role === 'owner' ? 0 : u.role === 'mod' ? 1 : 2);
+    const others = lastRoom.users.filter((u) => !u.host)
+      .map((u, i) => ({ u, i })).sort((a, b) => weight(a.u) - weight(b.u) || a.i - b.i).map((x) => x.u);
     const rank = Math.max(0, others.findIndex((u) => u.id === myId));
     let attempts = 0;
 
@@ -1338,10 +2170,13 @@
     let share = lastRoom.share;
     if (share && oldHost && share.peer === oldHost.id) share = null;
     else if (share && share.peer === oldId) share = { ...share, peer: myId };
-    room = { ...lastRoom, pos, at: Date.now(), users: [], share };
+    room = { ...lastRoom, pos, at: Date.now(), users: [], share, waiting: null };
+    if (!room.owner) room.owner = ident.uid;
     for (const c of outCalls.values()) { try { c.close(); } catch { /* ignore */ } }
     outCalls.clear();
     closeView();
+    buffering.clear();
+    if (!lastRoom.playing && lastRoom.waiting) room.playing = true;   // a wait in progress resumes
     wireHostPeer(peer);
     setConnected(true);
     systemMsg(`${myName} is now hosting`);
@@ -1380,8 +2215,9 @@
     const p = new Peer(PEER_PREFIX + code, PEER_OPTIONS);
     peer = p;
     let opened = false;
-    p.on('open', (id) => {
+    p.on('open', async (id) => {
       opened = true;
+      await ident.ready;
       isHost = true;
       myId = id;
       createdThisRoom = !!opts.created;
@@ -1393,7 +2229,10 @@
         const m = sanitizeMedia(snap.media);
         if (m) { room.media = m; room.pos = Math.max(0, Number(snap.pos) || 0); room.at = hostNow(); room.playing = false; }
         room.queue = Array.isArray(snap.queue) ? snap.queue.slice(0, MAX_QUEUE).map(sanitizeMedia).filter(Boolean) : [];
+        const extra = sanitizeRoom({ ...snap, users: [] });
+        for (const k of ['owner', 'mods', 'settings', 'pass', 'banned', 'muted', 'allowed']) room[k] = extra[k];
       }
+      if (!room.owner) room.owner = ident.uid;   // new rooms, and rooms saved before roles existed
       enterRoom();
       setConnected(true);
       systemMsg(withCode ? `${myName} reopened the room` : `${myName} opened the room`);
@@ -1421,6 +2260,11 @@
   function startGuest(roomCode, opts = {}) {
     code = roomCode;
     createdThisRoom = false;
+    lastJoinOpts = opts;
+    deniedReason = null;
+    welcomed = false;
+    const saved = getSavedRoom(roomCode);
+    joinPassword = opts.password || (saved && saved.pass) || '';
     stopLobbyPeer();
     const p = new Peer(PEER_OPTIONS);
     peer = p;
@@ -1439,10 +2283,18 @@
         if (why === 'not-found') lobbyError(`Nobody is in room ${roomCode} right now.`, roomCode);
         else lobbyError("Couldn't connect to the room. Some networks block peer-to-peer connections; try another network or ask the host for a new link.");
       });
-      // Show the room as soon as the connection opens.
+      // Show the room once the host lets us in.
+      const startedAt = Date.now();
       const wait = setInterval(() => {
-        if (hostConn) { clearInterval(wait); enterRoom(); }
-        else if (!peer) clearInterval(wait);
+        if (welcomed) { clearInterval(wait); enterRoom(); return; }
+        if (!peer || deniedReason) { clearInterval(wait); return; }
+        if (Date.now() - startedAt > 20000) {
+          clearInterval(wait);
+          try { peer.destroy(); } catch { /* ignore */ }
+          peer = null;
+          hostConn = null;
+          lobbyError("The room didn't let you in. Try again in a moment.");
+        }
       }, 50);
     });
     p.on('error', (err) => {
@@ -1491,6 +2343,7 @@
       name: room.name || (saved && saved.name) || '',
       owner: saved ? !!saved.owner || createdThisRoom : createdThisRoom,
       lastVisited: Date.now(),
+      ...(joinPassword ? { pass: joinPassword } : {}),
     });
     render();
     renderAllChat();
@@ -1502,7 +2355,7 @@
       $('now-title').textContent = room.share.peer === myId ? 'Your tab' : `${room.share.name}'s tab`;
       $('now-by').textContent = 'Live tab share';
     } else {
-      $('now-title').textContent = m ? (m.title || (m.kind === 'youtube' ? 'YouTube video' : 'Video')) : 'Nothing playing';
+      $('now-title').textContent = m ? (m.title || fallbackTitle(m)) : 'Nothing playing';
       $('now-by').textContent = m ? `Added by ${m.by}` : '';
     }
     $('room-name').textContent = room.name || '';
@@ -1510,8 +2363,12 @@
     renderShare();
     reconcileShare();
     saveSnapshotSoon();
-    $('next-btn').disabled = room.queue.length === 0;
     $('stage-error-next').textContent = room.queue.length ? 'Skip to next' : 'Clear player';
+    renderPermissions();
+    renderSettings();
+    const w = room.waiting && !room.share ? room.waiting : null;
+    $('wait-banner').hidden = !w;
+    if (w) $('wait-text').textContent = w.length === 1 && w[0] === myName ? 'Loading… the room is waiting for you' : `Waiting for ${w.join(', ')} to load…`;
     $('queue-count').textContent = room.queue.length;
     $('people-count').textContent = Math.max(1, room.users.length);
     renderQueue();
@@ -1534,15 +2391,16 @@
       main.className = 'q-main';
       const title = document.createElement('span');
       title.className = 'q-title';
-      title.textContent = q.title || (q.kind === 'youtube' ? 'YouTube video' : 'Video');
+      title.textContent = q.title || fallbackTitle(q);
       title.title = title.textContent;
       const sub = document.createElement('span');
       sub.className = 'q-sub';
-      sub.textContent = `${q.kind === 'youtube' ? 'YouTube' : 'Video file'} · ${q.by}`;
+      sub.textContent = `${SOURCE[q.kind] || 'Video'}${q.live ? ' live' : ''} · ${q.by}`;
       main.append(title, sub);
 
       const actions = document.createElement('div');
       actions.className = 'q-actions';
+      actions.hidden = !canControl();
       actions.append(
         iconBtn('▶', 'Play now', () => sendAction({ type: 'playNow', uid: q.uid })),
         iconBtn('↑', 'Move up', () => sendAction({ type: 'up', uid: q.uid }), i === 0),
@@ -1568,7 +2426,8 @@
   function renderPeople() {
     const list = $('people-list');
     list.textContent = '';
-    const users = room.users.length ? room.users : [{ id: myId, name: myName, host: isHost }];
+    const users = room.users.length ? room.users : [{ id: myId, name: myName, host: isHost, role: 'member' }];
+    const myRole = (me() || {}).role || 'member';
     for (const u of users) {
       const li = document.createElement('li');
       li.className = 'person';
@@ -1579,18 +2438,176 @@
       const nm = document.createElement('span');
       nm.className = 'person-name';
       nm.textContent = u.name;
-      li.append(av, nm);
-      if (u.host) li.append(tag('Host', true));
-      if (u.id === myId) li.append(tag('You'));
+      const tags = document.createElement('span');
+      tags.className = 'person-tags';
+      if (u.role === 'owner') tags.append(tag('Owner', 'owner'));
+      if (u.role === 'mod') tags.append(tag('Mod', 'mod'));
+      if (u.muted) tags.append(tag('Muted', 'muted'));
+      if (u.id === myId) tags.append(tag('You'));
+      li.append(av, nm, tags);
+      const canTouch = u.id !== myId && u.role !== 'owner' && (myRole === 'owner' || (myRole === 'mod' && u.role === 'member'));
+      if (canTouch) {
+        const more = document.createElement('button');
+        more.type = 'button';
+        more.className = 'icon-btn person-more';
+        more.textContent = '⋯';
+        more.setAttribute('aria-label', `Options for ${u.name}`);
+        more.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const items = [];
+          if (myRole === 'owner' && u.uid) {
+            items.push(u.role === 'mod'
+              ? { label: 'Remove as moderator', run: () => sendAction({ type: 'unmod', target: u.id }) }
+              : { label: 'Make moderator', run: () => sendAction({ type: 'mod', target: u.id }) });
+          }
+          items.push(u.muted
+            ? { label: 'Unmute in chat', run: () => sendAction({ type: 'unmute', target: u.id }) }
+            : { label: 'Mute in chat', run: () => sendAction({ type: 'mute', target: u.id }) });
+          items.push({ label: 'Remove from room', danger: true, run: () => sendAction({ type: 'kick', target: u.id }) });
+          openPopMenu(more, items);
+        });
+        li.append(more);
+      }
       list.appendChild(li);
     }
   }
-  function tag(text, host) {
+  function tag(text, kind) {
     const t = document.createElement('span');
-    t.className = host ? 'tag tag-host' : 'tag';
+    t.className = kind ? `tag tag-${kind}` : 'tag';
     t.textContent = text;
     return t;
   }
+
+  // ---------- permissions in the UI ----------
+  const canControl = () => iAmMod() || room.settings.playback === 'all';
+  const canAdd = () => iAmMod() || room.settings.adding === 'all';
+
+  function renderPermissions() {
+    const mod = iAmMod();
+    const S = room.settings;
+    const control = canControl();
+    const add = canAdd();
+    $('url-input').disabled = !control && !add;
+    $('url-input').placeholder = !control && !add ? 'Only moderators can add videos in this room'
+      : (YT_KEY ? 'Paste a link or search YouTube' : 'Paste a YouTube, Vimeo, Twitch or video link');
+    $('add-form').querySelector('[data-mode=play]').disabled = !control;
+    $('add-form').querySelector('[data-mode=queue]').disabled = !add;
+    $('share-btn').disabled = !control;
+    $('share-btn').title = control ? 'Stream one of your browser tabs to the room' : 'Only moderators can share in this room';
+
+    // Next / vote to skip
+    const next = $('next-btn');
+    const voting = !mod && S.skip === 'vote';
+    if (voting) {
+      const have = liveVoters().length;
+      const voted = !!(room.votes && room.media && room.votes.mid === room.media.uid && room.votes.voters.includes(myId));
+      next.textContent = voted ? `Voted · ${have}/${votesNeeded()}` : (have ? `Vote to skip · ${have}/${votesNeeded()}` : 'Vote to skip');
+      next.disabled = voted || !room.media || !control;
+    } else {
+      next.textContent = 'Next in queue';
+      next.disabled = room.queue.length === 0 || !control;
+    }
+
+    // Chat
+    const self = me();
+    const muted = !!(self && self.muted);
+    const chatLocked = S.chat === 'mods' && !mod;
+    const input = $('chat-input');
+    input.disabled = muted || chatLocked;
+    input.placeholder = muted ? "You're muted in this room" : chatLocked ? 'Only moderators can chat right now' : 'Say something';
+    $('chat-form').querySelector('button').disabled = muted || chatLocked;
+
+    // Plain-language summary of the rules, for everyone
+    const rules = [];
+    rules.push(S.playback === 'mods' ? 'Only moderators can play, pause and skip.' : 'Everyone can play, pause and skip.');
+    if (S.adding === 'mods') rules.push('Only moderators can add videos.');
+    if (S.chat === 'mods') rules.push('Only moderators can chat.');
+    if (S.skip === 'vote') rules.push('Skipping needs a majority vote, except for moderators.');
+    if (room.pass) rules.push('The room has a password.');
+    $('room-rules').textContent = rules.join(' ');
+    $('room-rules').hidden = mod;
+  }
+
+  function renderSettings() {
+    const mod = iAmMod();
+    $('room-settings').hidden = !mod;
+    if (!mod) return;
+    for (const seg of document.querySelectorAll('#room-settings .seg')) {
+      const k = seg.dataset.setting;
+      const v = k === 'waitBuffer' ? (room.settings.waitBuffer ? 'on' : 'off') : room.settings[k];
+      for (const b of seg.querySelectorAll('button')) {
+        const on = b.dataset.v === v;
+        b.classList.toggle('is-on', on);
+        b.setAttribute('aria-pressed', String(on));
+      }
+    }
+    $('pw-state').textContent = room.pass ? 'On' : 'Off';
+    $('pw-state').classList.toggle('is-on', !!room.pass);
+    $('pw-set').textContent = room.pass ? 'Change' : 'Set password';
+    $('pw-clear').hidden = !room.pass;
+    const kicked = $('kicked-list');
+    kicked.textContent = '';
+    $('kicked-box').hidden = !room.banned.length;
+    for (const b of room.banned) {
+      const li = document.createElement('li');
+      const n = document.createElement('span');
+      n.textContent = b.name;
+      const back = document.createElement('button');
+      back.type = 'button';
+      back.className = 'btn btn-ghost btn-sm';
+      back.textContent = 'Let back in';
+      back.addEventListener('click', () => sendAction({ type: 'unban', uid: b.uid }));
+      li.append(n, back);
+      kicked.appendChild(li);
+    }
+  }
+
+  document.querySelectorAll('#room-settings .seg').forEach((seg) => {
+    seg.addEventListener('click', (e) => {
+      const b = e.target.closest('button');
+      if (!b) return;
+      const key = seg.dataset.setting;
+      const value = key === 'waitBuffer' ? b.dataset.v === 'on' : b.dataset.v;
+      sendAction({ type: 'setting', key, value });
+    });
+  });
+  $('pw-set').addEventListener('click', async () => {
+    const pw = await ask({
+      title: room.pass ? 'Change password' : 'Set a password',
+      label: 'People joining will need this. Everyone already here stays in.',
+      ok: 'Save', type: 'password', maxLength: 64,
+    });
+    if (!pw) return;
+    updateRoom(code, { pass: pw });
+    sendAction({ type: 'setPassword', password: pw });
+  });
+  $('pw-clear').addEventListener('click', () => sendAction({ type: 'clearPassword' }));
+
+  // ---------- small floating menu (people options) ----------
+  function openPopMenu(anchor, items) {
+    const menu = $('pop-menu');
+    menu.textContent = '';
+    for (const it of items) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.setAttribute('role', 'menuitem');
+      b.textContent = it.label;
+      if (it.danger) b.className = 'danger';
+      b.addEventListener('click', () => { closePopMenu(); it.run(); });
+      menu.appendChild(b);
+    }
+    menu.hidden = false;
+    const r = anchor.getBoundingClientRect();
+    const w = menu.offsetWidth;
+    const h = menu.offsetHeight;
+    menu.style.left = `${Math.max(8, Math.min(r.right - w, window.innerWidth - w - 8))}px`;
+    menu.style.top = `${r.bottom + 6 + h > window.innerHeight ? Math.max(8, r.top - h - 6) : r.bottom + 6}px`;
+    if (menu.firstChild) menu.firstChild.focus();
+  }
+  function closePopMenu() { $('pop-menu').hidden = true; }
+  document.addEventListener('click', (e) => { if (!$('pop-menu').hidden && !$('pop-menu').contains(e.target)) closePopMenu(); });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closePopMenu(); });
+  window.addEventListener('resize', closePopMenu);
 
   function chatNode(m) {
     const li = document.createElement('li');
@@ -1600,7 +2617,7 @@
     if (m.system) {
       li.className = 'msg-system';
       const text = document.createElement('span');
-      text.textContent = String(m.text || '');
+      renderWithTimestamps(text, String(m.text || ''));
       li.append(time, text);
       return li;
     }
@@ -1613,10 +2630,36 @@
     head.append(name, time);
     const text = document.createElement('div');
     text.className = 'msg-text';
-    text.textContent = String(m.text || '').slice(0, 400);
+    renderWithTimestamps(text, String(m.text || '').slice(0, 400));
     li.append(head, text);
     return li;
   }
+  // "12:34" or "1:02:03" in chat becomes a button that takes everyone there.
+  const TS_RE = /\b(?:(\d{1,2}):)?([0-5]?\d):([0-5]\d)\b/g;
+  function renderWithTimestamps(el, text) {
+    let last = 0;
+    for (const m of text.matchAll(TS_RE)) {
+      el.append(text.slice(last, m.index));
+      const secs = (+(m[1] || 0)) * 3600 + (+m[2]) * 60 + (+m[3]);
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'ts';
+      b.textContent = m[0];
+      b.title = `Jump everyone to ${m[0]}`;
+      b.addEventListener('click', () => jumpTo(secs));
+      el.append(b);
+      last = m.index + m[0].length;
+    }
+    el.append(text.slice(last));
+  }
+  function jumpTo(secs) {
+    if (room.share) return toast("You can't jump during a tab share.");
+    if (!room.media) return toast('Nothing is playing.');
+    if (room.media.live) return toast("You can't jump in a live stream.");
+    if (!canControl()) return toast('Only moderators can control playback in this room.');
+    sendAction({ type: 'seek', pos: secs });
+  }
+
   function appendChat(m) {
     const list = $('chat-list');
     const nearBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 80;
@@ -1713,7 +2756,13 @@
   function saveSnapshot() {
     clearTimeout(snapTimer);
     if (!code || !$('lobby').hidden) return;
-    const patch = { snapshot: { media: room.media, pos: expectedPos(), queue: room.queue } };
+    const patch = {
+      snapshot: {
+        media: room.media, pos: expectedPos(), queue: room.queue,
+        owner: room.owner, mods: room.mods, settings: room.settings, pass: room.pass,
+        banned: room.banned, muted: room.muted, allowed: room.allowed,
+      },
+    };
     if (room.name) patch.name = room.name;
     updateRoom(code, patch);
   }
@@ -1812,6 +2861,9 @@
     });
     conn.on('data', (d) => {
       if (!d || d.t !== 'peekInfo') return;
+      if (d.private) {
+        return finish({ state: 'live', private: true, count: Math.max(0, Math.min(999, Number(d.count) || 0)), name: cleanRoomName(d.name) });
+      }
       finish({
         state: 'live',
         users: Array.isArray(d.users) ? d.users.slice(0, 100).map((u) => cleanName(u && u.name)) : null,
@@ -1844,6 +2896,12 @@
       l.className = 'occ-label';
       l.textContent = 'Checking';
       box.append(dots, l);
+    } else if (st.state === 'live' && st.private) {
+      const l = document.createElement('span');
+      l.className = 'lock occ-live';
+      l.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><rect x="5" y="11" width="14" height="10" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3" fill="none" stroke="currentColor" stroke-width="2"/></svg>';
+      l.append(document.createTextNode(st.count ? `Private · ${st.count} inside` : 'Private'));
+      box.append(l);
     } else if (st.state === 'live') {
       const users = st.users;
       if (users && users.length) {
@@ -2000,7 +3058,7 @@
 
   // ---------- naming dialog (create room, rename, change your name) ----------
   let askResolve = null;
-  function ask({ title, label, value = '', placeholder = '', ok, maxLength = 40 }) {
+  function ask({ title, label, value = '', placeholder = '', ok, maxLength = 40, type = 'text' }) {
     return new Promise((resolve) => {
       const d = $('ask-dialog');
       if (typeof d.showModal !== 'function') {
@@ -2014,6 +3072,8 @@
       input.value = value;
       input.placeholder = placeholder;
       input.maxLength = maxLength;
+      input.type = type;
+      input.autocomplete = type === 'password' ? 'current-password' : 'off';
       $('ask-ok').textContent = ok;
       askResolve = resolve;
       d.showModal();
@@ -2122,16 +3182,231 @@
     const mode = (e.submitter && e.submitter.dataset.mode) || 'play';
     const raw = $('url-input').value.trim();
     if (!raw) return $('url-input').focus();
+    const looksLikeLink = /^\S+\.\S+$/.test(raw) || /^https?:/i.test(raw);
     const m = parseMedia(raw);
-    if (!m) {
-      toast("That isn't a YouTube video link or a direct video file link.", 3500);
+    if (!m && !looksLikeLink) {
+      if (!YT_KEY) return toast("Search isn't set up on this site yet. Paste a video link instead.", 5000);
+      runSearch(raw);
       return;
     }
+    if (!m) {
+      toast("That link isn't a YouTube, Vimeo, Twitch or Dailymotion video, or a direct video file.", 4000);
+      return;
+    }
+    if (m.kind === 'unsupported') return toast(m.reason, 6000);
+    if (m.kind === 'dailymotion' && !DM_PLAYER_ID) return toast('Dailymotion links need a free Player ID set in js/config.js. The README explains how.', 6000);
+    if (m.kind === 'ytplaylist') {
+      $('url-input').value = '';
+      addPlaylist(m.list, mode);
+      return;
+    }
+    if (m.inList) setTimeout(() => toast('Added this one video. To add the whole playlist, paste its playlist link (youtube.com/playlist?list=…).', 6000), 2700);
     const queued = mode === 'queue' && !!room.media;
     sendAction({ type: mode === 'queue' ? 'enqueue' : 'load', media: { raw } });
     $('url-input').value = '';
     if (queued) toast('Added to the queue');
   });
+
+  // ---------- YouTube search ----------
+  const decodeHtml = (s) => { const t = document.createElement('textarea'); t.innerHTML = s || ''; return t.value; };
+  function isoDuration(iso) {
+    const m = String(iso || '').match(/^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/);
+    if (!m) return '';
+    return fmt((+(m[1] || 0)) * 3600 + (+(m[2] || 0)) * 60 + (+(m[3] || 0)));
+  }
+  function apiErrorText(j) {
+    const reason = j && j.error && j.error.errors && j.error.errors[0] && j.error.errors[0].reason;
+    if (reason === 'quotaExceeded' || reason === 'dailyLimitExceeded') return "Today's search limit is used up. Paste a link, or try again tomorrow.";
+    if (reason === 'keyInvalid' || reason === 'badRequest') return "The YouTube API key in js/config.js isn't valid.";
+    if (reason === 'forbidden' || reason === 'ipRefererBlocked' || reason === 'accessNotConfigured') return "This site isn't allowed to use the YouTube API key. Check the key's restrictions and that YouTube Data API v3 is enabled.";
+    return (j && j.error && j.error.message) || 'YouTube search failed.';
+  }
+
+  let searchSeq = 0;
+  async function runSearch(q) {
+    const seq = ++searchSeq;
+    $('search-results').hidden = false;
+    $('search-title').textContent = `Results for "${q.slice(0, 60)}"`;
+    $('search-list').textContent = '';
+    $('search-status').hidden = false;
+    $('search-status').textContent = 'Searching YouTube…';
+    try {
+      const p = new URLSearchParams({ part: 'snippet', type: 'video', videoEmbeddable: 'true', maxResults: '12', q, key: YT_KEY });
+      const r = await fetch(`https://www.googleapis.com/youtube/v3/search?${p}`);
+      const j = await r.json();
+      if (!r.ok) throw new Error(apiErrorText(j));
+      const items = (j.items || []).filter((i) => i.id && i.id.videoId && i.snippet);
+      const details = {};
+      if (items.length) {
+        const dp = new URLSearchParams({ part: 'contentDetails', id: items.map((i) => i.id.videoId).join(','), key: YT_KEY });
+        const dr = await fetch(`https://www.googleapis.com/youtube/v3/videos?${dp}`);
+        if (dr.ok) for (const v of (await dr.json()).items || []) details[v.id] = v;
+      }
+      if (seq !== searchSeq) return;
+      const results = items.map((i) => {
+        const v = details[i.id.videoId];
+        const rating = v && v.contentDetails && v.contentDetails.contentRating;
+        const th = i.snippet.thumbnails || {};
+        return {
+          id: i.id.videoId,
+          title: decodeHtml(i.snippet.title),
+          channel: decodeHtml(i.snippet.channelTitle),
+          thumb: (th.medium || th.default || {}).url || '',
+          duration: v ? isoDuration(v.contentDetails.duration) : '',
+          live: i.snippet.liveBroadcastContent === 'live',
+          age: !!(rating && rating.ytRating === 'ytAgeRestricted'),
+        };
+      });
+      renderSearch(results);
+    } catch (e) {
+      if (seq !== searchSeq) return;
+      $('search-status').hidden = false;
+      $('search-status').textContent = (e && e.message) || 'YouTube search failed.';
+    }
+  }
+
+  function renderSearch(results) {
+    const list = $('search-list');
+    list.textContent = '';
+    $('search-status').hidden = results.length > 0;
+    if (!results.length) $('search-status').textContent = 'No videos found. Try other words.';
+    for (const r of results) {
+      const li = document.createElement('li');
+      li.className = 'sr';
+      const thumb = document.createElement('div');
+      thumb.className = 'sr-thumb';
+      if (/^https:\/\/i\d?\.ytimg\.com\//.test(r.thumb)) {
+        const img = document.createElement('img');
+        img.src = r.thumb;
+        img.alt = '';
+        img.loading = 'lazy';
+        thumb.appendChild(img);
+      }
+      if (r.live || r.duration) {
+        const badge = document.createElement('span');
+        badge.className = r.live ? 'sr-badge live' : 'sr-badge';
+        badge.textContent = r.live ? 'LIVE' : r.duration;
+        thumb.appendChild(badge);
+      }
+      const info = document.createElement('div');
+      info.className = 'sr-info';
+      const t = document.createElement('span');
+      t.className = 'sr-title';
+      t.textContent = r.title;
+      t.title = r.title;
+      const ch = document.createElement('span');
+      ch.className = 'sr-channel';
+      ch.textContent = r.channel;
+      info.append(t, ch);
+      if (r.age) {
+        const note = document.createElement('p');
+        note.className = 'sr-note';
+        note.textContent = "Age-restricted: YouTube won't play it here. Open it on YouTube and use Share a tab.";
+        info.append(note);
+      } else {
+        const actions = document.createElement('div');
+        actions.className = 'sr-actions';
+        const media = { raw: `https://www.youtube.com/watch?v=${r.id}`, title: r.title };
+        const play = document.createElement('button');
+        play.type = 'button';
+        play.className = 'btn btn-primary';
+        play.textContent = 'Play now';
+        play.disabled = !canControl();
+        play.addEventListener('click', () => { sendAction({ type: 'load', media }); closeSearch(); });
+        const queue = document.createElement('button');
+        queue.type = 'button';
+        queue.className = 'btn btn-ghost';
+        queue.textContent = 'Add to queue';
+        queue.disabled = !canAdd();
+        queue.addEventListener('click', () => {
+          const had = !!room.media;
+          sendAction({ type: 'enqueue', media });
+          queue.textContent = 'Added';
+          queue.disabled = true;
+          if (had) toast('Added to the queue');
+        });
+        actions.append(play, queue);
+        info.append(actions);
+      }
+      li.append(thumb, info);
+      list.appendChild(li);
+    }
+  }
+  function closeSearch() {
+    searchSeq++;
+    $('search-results').hidden = true;
+    $('search-list').textContent = '';
+  }
+  $('search-close').addEventListener('click', closeSearch);
+
+  // ---------- YouTube playlists ----------
+  async function expandPlaylist(listId) {
+    if (YT_KEY) {
+      const out = [];
+      let page = '';
+      do {
+        const params = new URLSearchParams({ part: 'snippet', maxResults: '50', playlistId: listId, key: YT_KEY });
+        if (page) params.set('pageToken', page);
+        const r = await fetch(`https://www.googleapis.com/youtube/v3/playlistItems?${params}`);
+        const j = await r.json();
+        if (!r.ok) throw new Error((j && j.error && j.error.message) || 'YouTube refused the request');
+        for (const it of j.items || []) {
+          const id = it.snippet && it.snippet.resourceId && it.snippet.resourceId.videoId;
+          const title = it.snippet && it.snippet.title;
+          if (id && title !== 'Private video' && title !== 'Deleted video') out.push({ id, title });
+        }
+        page = j.nextPageToken || '';
+      } while (page && out.length < MAX_QUEUE);
+      return out.slice(0, MAX_QUEUE);
+    }
+    // No API key: a hidden YouTube player can list a playlist's videos (titles get looked up after).
+    await loadYouTubeApi();
+    return new Promise((resolve) => {
+      const box = document.createElement('div');
+      box.style.cssText = 'position:fixed;left:-10000px;top:0;width:320px;height:180px;';
+      const inner = document.createElement('div');
+      box.appendChild(inner);
+      document.body.appendChild(box);
+      let done = false;
+      let hidden = null;
+      const finish = (ids) => {
+        if (done) return;
+        done = true;
+        try { if (hidden) hidden.destroy(); } catch { /* gone */ }
+        box.remove();
+        resolve((ids || []).slice(0, MAX_QUEUE).map((id) => ({ id })));
+      };
+      hidden = new YT.Player(inner, {
+        width: 320, height: 180,
+        playerVars: { listType: 'playlist', list: listId, autoplay: 0 },
+        events: {
+          onReady: () => {
+            let tries = 0;
+            const t = setInterval(() => {
+              const ids = hidden.getPlaylist && hidden.getPlaylist();
+              if ((ids && ids.length) || ++tries > 30) { clearInterval(t); finish(ids); }
+            }, 200);
+          },
+          onError: () => finish([]),
+        },
+      });
+      setTimeout(() => finish([]), 15000);
+    });
+  }
+
+  async function addPlaylist(listId, mode) {
+    toast('Loading the playlist…', 10000);
+    let items = [];
+    try { items = await expandPlaylist(listId); } catch (e) {
+      return toast(`Couldn't load that playlist: ${(e && e.message) || 'unknown error'}.`, 6000);
+    }
+    if (!items.length) return toast("Couldn't read that playlist. It may be private or empty.", 6000);
+    sendAction({
+      type: mode === 'queue' ? 'enqueueMany' : 'loadMany',
+      items: items.map((it) => ({ raw: `https://www.youtube.com/watch?v=${it.id}`, title: it.title || '' })),
+    });
+    toast(`Added ${items.length} video${items.length === 1 ? '' : 's'} from the playlist`, 4000);
+  }
 
   $('next-btn').addEventListener('click', () => sendAction({ type: 'next' }));
   $('stage-error-next').addEventListener('click', () => sendAction({ type: 'next' }));
@@ -2141,8 +3416,11 @@
     const input = $('chat-input');
     const text = input.value.trim().slice(0, 400);
     if (!text) return;
-    if (isHost) pushChat({ from: myId, name: myName, text, ts: Date.now() });
-    else if (hostConn && hostConn.open) hostConn.send({ t: 'chat', text });
+    if (isHost) {
+      const why = chatBlocked(myId);
+      if (why) return toast(why, 4000);
+      pushChat({ from: myId, name: myName, text, ts: Date.now() });
+    } else if (hostConn && hostConn.open) hostConn.send({ t: 'chat', text });
     else return toast('Reconnecting to the room…');
     input.value = '';
   });
@@ -2223,6 +3501,7 @@
     $('invite-whatsapp').href = 'https://wa.me/?text=' + encodeURIComponent(inviteMessage());
     $('invite-telegram').href = 'https://t.me/share/url?url=' + encodeURIComponent(link) + '&text=' + encodeURIComponent(inviteText());
     $('invite-native').hidden = typeof navigator.share !== 'function';
+    $('invite-pass-note').hidden = !room.pass;
     renderQR(link);
     const d = $('invite-dialog');
     if (typeof d.showModal === 'function') {
@@ -2265,6 +3544,11 @@
     }, 120);
   });
 
+  // Pasting an invite link into a tab that's already on the lobby: start over with that room.
+  window.addEventListener('hashchange', () => {
+    if (!$('lobby').hidden && normCode(location.hash.slice(1)).length === 6) location.reload();
+  });
+
   window.addEventListener('pagehide', () => {
     if ($('lobby').hidden) saveSnapshot();
     leaving = true;
@@ -2272,6 +3556,11 @@
     if (hostConn && hostConn.open) { try { hostConn.send({ t: 'bye' }); } catch { /* ignore */ } }
     try { if (peer) peer.destroy(); } catch { /* ignore */ }
   });
+
+  // Test hook, only with ?debug in the address.
+  if (/[?&]debug\b/.test(location.search)) {
+    window.__watchroom = { get room() { return room; }, ident, get isHost() { return isHost; }, get myId() { return myId; } };
+  }
 
   // ---------- boot ----------
   (function boot() {
@@ -2284,6 +3573,9 @@
       $('create-btn').disabled = true;
       return;
     }
+    let notice = null;
+    try { notice = sessionStorage.getItem('watchroom-notice'); sessionStorage.removeItem('watchroom-notice'); } catch { /* ignore */ }
+    if (notice) setTimeout(() => toast(notice, 6000), 300);
     if (hashCode.length !== 6 && saved) {
       showRoomsView();
       return;
