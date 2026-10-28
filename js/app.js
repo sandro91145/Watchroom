@@ -60,7 +60,7 @@
   let migrating = false;
 
   function emptyRoom() {
-    return { media: null, playing: false, pos: 0, at: 0, rate: 1, queue: [], users: [], share: null };
+    return { name: '', media: null, playing: false, pos: 0, at: 0, rate: 1, queue: [], users: [], share: null };
   }
   const hostNow = () => Date.now() + clockOffset;
   function expectedPos(r = room) {
@@ -84,6 +84,9 @@
     let h = 0;
     for (const ch of String(str)) h = (h * 31 + ch.codePointAt(0)) >>> 0;
     return AVATAR_COLORS[h % AVATAR_COLORS.length];
+  }
+  function cleanRoomName(n) {
+    return String(n || '').replace(/\s+/g, ' ').trim().slice(0, 40);
   }
   function cleanName(n) {
     return String(n || '').replace(/\s+/g, ' ').trim().slice(0, 24) || 'Guest';
@@ -967,6 +970,19 @@
         case 'ping':
           conn.send({ t: 'pong', c: d.c, h: Date.now() });
           break;
+        case 'peek':
+          // A lobby checking who's here. Answer and hang up; it never joins.
+          if (g.ready) return;
+          conn.send({
+            t: 'peekInfo',
+            name: room.name,
+            users: room.users.map((u) => ({ name: u.name })),
+            now: room.share ? '' : (room.media ? (room.media.title || '') : ''),
+            share: !!room.share,
+          });
+          guests.delete(conn.peer);
+          setTimeout(() => { try { conn.close(); } catch { /* ignore */ } }, 800);
+          break;
         case 'action':
           if (g.ready) handleAction(conn.peer, d.a);
           break;
@@ -1119,6 +1135,7 @@
   }
   function sanitizeRoom(r) {
     return {
+      name: cleanRoomName(r.name),
       media: sanitizeMedia(r.media),
       playing: !!r.playing,
       pos: Math.max(0, Number(r.pos) || 0),
@@ -1233,8 +1250,16 @@
     }
   }
 
-  function startHost(withCode) {
+  /**
+   * Opens a room with this browser as host.
+   * opts.name      room name
+   * opts.snapshot  { media, pos, queue } to restore when reopening a saved room
+   * opts.created   true for a brand-new room (marks it as yours in My Rooms)
+   * opts.fallbackGuest  join instead if someone already has the room open
+   */
+  function startHost(withCode, opts = {}) {
     code = withCode || genCode();
+    stopLobbyPeer();
     const p = new Peer(PEER_PREFIX + code, PEER_OPTIONS);
     peer = p;
     let opened = false;
@@ -1242,18 +1267,29 @@
       opened = true;
       isHost = true;
       myId = id;
+      createdThisRoom = !!opts.created;
       room = emptyRoom();
+      const saved = getSavedRoom(code);
+      room.name = cleanRoomName(opts.name || (saved && saved.name)) || `${myName}'s room`;
+      const snap = opts.snapshot;
+      if (snap && typeof snap === 'object') {
+        const m = sanitizeMedia(snap.media);
+        if (m) { room.media = m; room.pos = Math.max(0, Number(snap.pos) || 0); room.at = hostNow(); room.playing = false; }
+        room.queue = Array.isArray(snap.queue) ? snap.queue.slice(0, MAX_QUEUE).map(sanitizeMedia).filter(Boolean) : [];
+      }
       enterRoom();
       setConnected(true);
-      systemMsg(`${myName} opened the room`);
+      systemMsg(withCode ? `${myName} reopened the room` : `${myName} opened the room`);
       broadcastState();
+      if (!withCode) openInvite();
     });
     p.on('error', (err) => {
       if (!opened) {
         try { p.destroy(); } catch { /* ignore */ }
         if (err.type === 'unavailable-id') {
+          if (withCode && opts.fallbackGuest) return startGuest(withCode);
           if (withCode) return lobbyError(`Room ${withCode} is already open. Join it instead.`);
-          return startHost();
+          return startHost(null, opts);
         }
         return lobbyError(peerErrorText(err));
       }
@@ -1264,8 +1300,11 @@
     p.on('disconnected', () => { if (!p.destroyed && !leaving) try { p.reconnect(); } catch { /* ignore */ } });
   }
 
-  function startGuest(roomCode) {
+  /** Joins a room. opts.fallbackHost: a saved room to reopen if nobody turns out to be inside. */
+  function startGuest(roomCode, opts = {}) {
     code = roomCode;
+    createdThisRoom = false;
+    stopLobbyPeer();
     const p = new Peer(PEER_OPTIONS);
     peer = p;
     p.on('call', onIncomingCall);
@@ -1276,6 +1315,10 @@
       connectToHost((why) => {
         try { p.destroy(); } catch { /* ignore */ }
         peer = null;
+        if (why === 'not-found' && opts.fallbackHost) {
+          const r = opts.fallbackHost;
+          return startHost(roomCode, { name: r.name, snapshot: r.snapshot });
+        }
         if (why === 'not-found') lobbyError(`Nobody is in room ${roomCode} right now.`, roomCode);
         else lobbyError("Couldn't connect to the room. Some networks block peer-to-peer connections; try another network or ask the host for a new link.");
       });
@@ -1320,11 +1363,18 @@
   }
 
   function enterRoom() {
+    stopLobbyPeer();
     $('lobby').hidden = true;
     $('room').hidden = false;
     $('room-code').textContent = code;
-    document.title = `${code} · Watchroom`;
     if (location.hash.slice(1) !== code) history.replaceState(null, '', '#' + code);
+    const saved = getSavedRoom(code);
+    upsertRoom({
+      code,
+      name: room.name || (saved && saved.name) || '',
+      owner: saved ? !!saved.owner || createdThisRoom : createdThisRoom,
+      lastVisited: Date.now(),
+    });
     render();
     renderAllChat();
   }
@@ -1338,8 +1388,11 @@
       $('now-title').textContent = m ? (m.title || (m.kind === 'youtube' ? 'YouTube video' : 'Video')) : 'Nothing playing';
       $('now-by').textContent = m ? `Added by ${m.by}` : '';
     }
+    $('room-name').textContent = room.name || '';
+    document.title = `${room.name || code} · Watchroom`;
     renderShare();
     reconcileShare();
+    saveSnapshotSoon();
     $('next-btn').disabled = room.queue.length === 0;
     $('stage-error-next').textContent = room.queue.length ? 'Skip to next' : 'Clear player';
     $('queue-count').textContent = room.queue.length;
@@ -1466,7 +1519,8 @@
     $('room').hidden = true;
     $('lobby').hidden = false;
     setLobbyBusy(false);
-    const el = $('lobby-error');
+    const inRooms = !$('rooms-view').hidden;
+    const el = inRooms ? $('rooms-error') : $('lobby-error');
     el.textContent = text + ' ';
     if (offerCode) {
       const b = document.createElement('button');
@@ -1474,19 +1528,23 @@
       b.className = 'btn btn-ghost btn-sm';
       b.textContent = `Open room ${offerCode} yourself`;
       b.addEventListener('click', () => {
-        if (!readName()) return;
+        if (!inRooms && !readName()) return;
         setLobbyBusy(true);
-        startHost(offerCode);
+        const saved = getSavedRoom(offerCode);
+        startHost(offerCode, { name: saved && saved.name, snapshot: saved && saved.snapshot });
       });
       el.appendChild(b);
     }
     el.hidden = false;
+    if (inRooms) refreshRooms();
   }
 
   function setLobbyBusy(busy) {
     $('create-btn').disabled = busy;
     $('join-btn').disabled = busy;
-    if (busy) $('lobby-error').hidden = true;
+    $('new-room-btn').disabled = busy;
+    $('rooms-view').classList.toggle('is-busy', busy);
+    if (busy) { $('lobby-error').hidden = true; $('rooms-error').hidden = true; }
   }
 
   // ---------- actions out ----------
@@ -1496,6 +1554,404 @@
     else if (hostConn && hostConn.open) hostConn.send({ t: 'action', a });
     else toast('Reconnecting to the room…');
   }
+
+  // =====================================================================
+  //  MY ROOMS — saved in this browser, with a live "who's inside" check
+  // =====================================================================
+  const ROOMS_KEY = 'watchroom-rooms';
+  let createdThisRoom = false;
+
+  function loadRooms() {
+    try {
+      const list = JSON.parse(store.get(ROOMS_KEY) || '[]');
+      return Array.isArray(list) ? list.filter((r) => r && typeof r.code === 'string' && /^[A-Z0-9]{6}$/.test(r.code)) : [];
+    } catch { return []; }
+  }
+  function saveRooms(list) { store.set(ROOMS_KEY, JSON.stringify(list.slice(0, 40))); }
+  function getSavedRoom(c) { return loadRooms().find((r) => r.code === c) || null; }
+  /** Adds or updates a room and moves it to the top. */
+  function upsertRoom(patch) {
+    const list = loadRooms();
+    const i = list.findIndex((r) => r.code === patch.code);
+    const merged = { ...(i >= 0 ? list[i] : { createdAt: Date.now() }), ...patch };
+    if (i >= 0) list.splice(i, 1);
+    list.unshift(merged);
+    saveRooms(list);
+  }
+  /** Updates a room in place, without changing the order. */
+  function updateRoom(c, patch) {
+    const list = loadRooms();
+    const i = list.findIndex((r) => r.code === c);
+    if (i < 0) return;
+    list[i] = { ...list[i], ...patch };
+    saveRooms(list);
+  }
+  function removeRoom(c) { saveRooms(loadRooms().filter((r) => r.code !== c)); }
+
+  let snapTimer = null;
+  function saveSnapshotSoon() {
+    clearTimeout(snapTimer);
+    snapTimer = setTimeout(saveSnapshot, 1500);
+  }
+  function saveSnapshot() {
+    clearTimeout(snapTimer);
+    if (!code || !$('lobby').hidden) return;
+    const patch = { snapshot: { media: room.media, pos: expectedPos(), queue: room.queue } };
+    if (room.name) patch.name = room.name;
+    updateRoom(code, patch);
+  }
+
+  // ---------- live check ----------
+  let lobbyPeer = null;
+  let lobbyTimer = null;
+  const roomStatus = new Map();         // code -> { state: checking|live|empty|unknown, users, now, share }
+  const probeFinishers = new Map();     // host peer id -> finish()
+
+  function openLobbyPeer() {
+    if (lobbyPeer && !lobbyPeer.destroyed && lobbyPeer.open) return Promise.resolve(lobbyPeer);
+    if (lobbyPeer && lobbyPeer._opening) return lobbyPeer._opening;
+    const p = new Peer(PEER_OPTIONS);
+    lobbyPeer = p;
+    p._opening = new Promise((resolve) => {
+      const t = setTimeout(() => resolve(null), 10000);
+      p.on('open', () => { clearTimeout(t); resolve(p); });
+      p.on('error', (err) => {
+        if (err && err.type === 'peer-unavailable') {
+          const m = String(err.message || '').match(/peer\s+(\S+)/i);
+          const finish = m && probeFinishers.get(m[1]);
+          if (finish) finish({ state: 'empty' });
+          return;
+        }
+        if (!p.open) { clearTimeout(t); resolve(null); }
+      });
+    });
+    p.on('disconnected', () => { if (!p.destroyed) try { p.reconnect(); } catch { /* ignore */ } });
+    return p._opening;
+  }
+
+  function stopLobbyPeer() {
+    clearInterval(lobbyTimer);
+    lobbyTimer = null;
+    for (const finish of [...probeFinishers.values()]) finish(null);
+    probeFinishers.clear();
+    if (lobbyPeer) { try { lobbyPeer.destroy(); } catch { /* ignore */ } lobbyPeer = null; }
+    $('rooms-refresh').classList.remove('is-spinning');
+  }
+
+  function setRoomStatus(c, st) {
+    roomStatus.set(c, st);
+    if (st.state === 'live' && st.name) {
+      const saved = getSavedRoom(c);
+      if (saved && saved.name !== st.name) updateRoom(c, { name: st.name });
+    }
+    renderRooms();
+  }
+
+  async function refreshRooms() {
+    const rooms = loadRooms();
+    if (!rooms.length || $('rooms-view').hidden || $('lobby').hidden) { renderRooms(); return; }
+    $('rooms-refresh').classList.add('is-spinning');
+    const p = await openLobbyPeer();
+    if (!p || $('rooms-view').hidden || $('lobby').hidden) {
+      $('rooms-refresh').classList.remove('is-spinning');
+      if (!p && !$('rooms-view').hidden) {
+        for (const r of rooms) roomStatus.set(r.code, { state: 'unknown' });
+        renderRooms();
+        $('rooms-error').textContent = "Couldn't check who's in your rooms: the matchmaking server didn't answer. You can still open them.";
+        $('rooms-error').hidden = false;
+      }
+      return;
+    }
+    for (const r of rooms) probeRoom(p, r.code);
+  }
+
+  function probeRoom(p, c) {
+    const id = PEER_PREFIX + c;
+    if (probeFinishers.has(id)) return;
+    const prev = roomStatus.get(c);
+    if (!prev || prev.state === 'unknown') { roomStatus.set(c, { state: 'checking' }); renderRooms(); }
+    let done = false;
+    let conn = null;
+    let timer = null;
+    let grace = null;
+    const finish = (st) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      clearTimeout(grace);
+      probeFinishers.delete(id);
+      try { if (conn) conn.close(); } catch { /* ignore */ }
+      if (st) setRoomStatus(c, st);
+      if (!probeFinishers.size) $('rooms-refresh').classList.remove('is-spinning');
+    };
+    probeFinishers.set(id, finish);
+    try { conn = p.connect(id, { reliable: true, serialization: 'json' }); } catch { conn = null; }
+    if (!conn) return finish({ state: 'unknown' });
+    timer = setTimeout(() => finish({ state: 'empty' }), 8000);
+    conn.on('open', () => {
+      try { conn.send({ t: 'peek' }); } catch { /* ignore */ }
+      // Rooms running an older version don't answer peeks but are clearly open.
+      grace = setTimeout(() => finish({ state: 'live', users: null }), 3000);
+    });
+    conn.on('data', (d) => {
+      if (!d || d.t !== 'peekInfo') return;
+      finish({
+        state: 'live',
+        users: Array.isArray(d.users) ? d.users.slice(0, 100).map((u) => cleanName(u && u.name)) : null,
+        name: cleanRoomName(d.name),
+        now: typeof d.now === 'string' ? d.now.slice(0, 120) : '',
+        share: !!d.share,
+      });
+    });
+    conn.on('error', () => finish({ state: 'empty' }));
+  }
+
+  // ---------- rendering ----------
+  function avatarEl(name, extraClass) {
+    const a = document.createElement('span');
+    a.className = 'avatar' + (extraClass ? ' ' + extraClass : '');
+    a.style.background = colorFor(name);
+    a.textContent = (String(name).match(/\p{L}|\p{N}/u) || ['?'])[0].toUpperCase();
+    a.title = name;
+    return a;
+  }
+
+  function occupancyEl(st) {
+    const box = document.createElement('div');
+    box.className = 'occupancy';
+    if (!st || st.state === 'checking') {
+      const dots = document.createElement('span');
+      dots.className = 'checking';
+      dots.innerHTML = '<span></span><span></span><span></span>';
+      const l = document.createElement('span');
+      l.className = 'occ-label';
+      l.textContent = 'Checking';
+      box.append(dots, l);
+    } else if (st.state === 'live') {
+      const users = st.users;
+      if (users && users.length) {
+        const stack = document.createElement('div');
+        stack.className = 'stack';
+        users.slice(0, 5).forEach((n) => stack.appendChild(avatarEl(n)));
+        if (users.length > 5) {
+          const more = document.createElement('span');
+          more.className = 'avatar more';
+          more.textContent = `+${users.length - 5}`;
+          stack.appendChild(more);
+        }
+        const l = document.createElement('span');
+        l.className = 'occ-label occ-live';
+        l.textContent = `${users.length} inside`;
+        box.append(stack, l);
+      } else {
+        const l = document.createElement('span');
+        l.className = 'occ-live';
+        l.textContent = 'Open now';
+        box.append(l);
+      }
+    } else if (st.state === 'empty') {
+      box.textContent = 'Nobody here';
+    } else {
+      box.textContent = '—';
+    }
+    return box;
+  }
+
+  function renderRooms() {
+    const list = $('rooms-list');
+    const rooms = loadRooms();
+    list.textContent = '';
+    $('rooms-empty').hidden = rooms.length > 0;
+    for (const r of rooms) {
+      const st = roomStatus.get(r.code);
+      const li = document.createElement('li');
+      li.className = 'room-row';
+
+      const menuBtn = document.createElement('button');
+      menuBtn.type = 'button';
+      menuBtn.className = 'icon-btn row-menu-btn';
+      menuBtn.textContent = '☰';
+      menuBtn.setAttribute('aria-label', `Options for ${r.name || r.code}`);
+      menuBtn.setAttribute('aria-haspopup', 'menu');
+      menuBtn.addEventListener('click', (e) => { e.stopPropagation(); openRowMenu(menuBtn, r.code); });
+
+      const open = document.createElement('button');
+      open.type = 'button';
+      open.className = 'room-open';
+      open.addEventListener('click', () => enterSavedRoom(r.code));
+
+      const info = document.createElement('div');
+      info.className = 'room-info';
+      const name = document.createElement('span');
+      name.className = 'room-name';
+      name.textContent = r.name || `Room ${r.code}`;
+      const sub = document.createElement('span');
+      sub.className = 'room-sub';
+      const codeEl = document.createElement('span');
+      codeEl.className = 'code';
+      codeEl.textContent = r.code;
+      const owner = document.createElement('span');
+      owner.textContent = r.owner ? 'Created by you' : 'Joined';
+      sub.append(codeEl, owner);
+      if (st && st.state === 'live' && (st.share || st.now)) {
+        const now = document.createElement('span');
+        now.className = 'room-now';
+        now.textContent = st.share ? 'Live tab share' : `Watching ${st.now}`;
+        sub.append(now);
+      }
+      info.append(name, sub);
+
+      const chev = document.createElement('span');
+      chev.className = 'chev';
+      chev.setAttribute('aria-hidden', 'true');
+      chev.textContent = '›';
+
+      open.append(info, occupancyEl(st), chev);
+      li.append(menuBtn, open);
+      list.appendChild(li);
+    }
+  }
+
+  function showRoomsView() {
+    $('welcome').hidden = true;
+    $('rooms-view').hidden = false;
+    $('lobby').classList.add('is-rooms');
+    renderMe();
+    renderRooms();
+    refreshRooms();
+    clearInterval(lobbyTimer);
+    lobbyTimer = setInterval(() => {
+      if (!document.hidden && !$('rooms-view').hidden && !$('lobby').hidden) refreshRooms();
+    }, 20000);
+  }
+
+  function renderMe() {
+    $('me-name').textContent = myName;
+    const av = $('me-avatar');
+    av.style.background = colorFor(myName);
+    av.textContent = (myName.match(/\p{L}|\p{N}/u) || ['?'])[0].toUpperCase();
+  }
+
+  function enterSavedRoom(c) {
+    const r = getSavedRoom(c);
+    if (!r) return;
+    const st = roomStatus.get(c);
+    setLobbyBusy(true);
+    if (st && st.state === 'live') startGuest(c, { fallbackHost: r });
+    else startHost(c, { name: r.name, snapshot: r.snapshot, fallbackGuest: true });
+  }
+
+  // ---------- row menu ----------
+  let menuCode = null;
+  function openRowMenu(btn, c) {
+    const menu = $('row-menu');
+    if (!menu.hidden && menuCode === c) return closeRowMenu();
+    menuCode = c;
+    const host = $('rooms-view').querySelector('.rooms-main').getBoundingClientRect();
+    const b = btn.getBoundingClientRect();
+    menu.style.left = `${b.left - host.left}px`;
+    menu.style.top = `${b.bottom - host.top + 6}px`;
+    menu.hidden = false;
+    menu.querySelector('button').focus();
+  }
+  function closeRowMenu() { $('row-menu').hidden = true; menuCode = null; }
+  document.addEventListener('click', (e) => { if (!$('row-menu').hidden && !$('row-menu').contains(e.target)) closeRowMenu(); });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !$('row-menu').hidden) closeRowMenu(); });
+
+  $('row-menu').addEventListener('click', async (e) => {
+    const act = e.target.closest('button') && e.target.closest('button').dataset.act;
+    const c = menuCode;
+    if (!act || !c) return;
+    closeRowMenu();
+    const r = getSavedRoom(c);
+    if (!r) return;
+    if (act === 'rename') {
+      const name = await ask({ title: 'Rename room', label: 'Room name', value: r.name || '', placeholder: `Room ${c}`, ok: 'Save' });
+      if (name === null) return;
+      updateRoom(c, { name: cleanRoomName(name) });
+      renderRooms();
+    } else if (act === 'copy') {
+      const ok = await copyText(`${location.origin}${location.pathname}#${c}`);
+      toast(ok ? 'Invite link copied' : `${location.origin}${location.pathname}#${c}`, ok ? 2600 : 8000);
+    } else if (act === 'remove') {
+      removeRoom(c);
+      roomStatus.delete(c);
+      renderRooms();
+      toast(`Removed ${r.name || c} from your rooms`);
+    }
+  });
+
+  // ---------- naming dialog (create room, rename, change your name) ----------
+  let askResolve = null;
+  function ask({ title, label, value = '', placeholder = '', ok, maxLength = 40 }) {
+    return new Promise((resolve) => {
+      const d = $('ask-dialog');
+      if (typeof d.showModal !== 'function') {
+        const v = window.prompt(label, value || placeholder);
+        resolve(v === null ? null : (v.trim() || placeholder));
+        return;
+      }
+      $('ask-title').textContent = title;
+      $('ask-label').textContent = label;
+      const input = $('ask-input');
+      input.value = value;
+      input.placeholder = placeholder;
+      input.maxLength = maxLength;
+      $('ask-ok').textContent = ok;
+      askResolve = resolve;
+      d.showModal();
+      input.focus();
+      input.select();
+    });
+  }
+  function closeAsk(val) {
+    const r = askResolve;
+    askResolve = null;
+    if ($('ask-dialog').open) $('ask-dialog').close();
+    if (r) r(val);
+  }
+  $('ask-form').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const input = $('ask-input');
+    closeAsk(input.value.trim() || input.placeholder || '');
+  });
+  $('ask-close').addEventListener('click', () => closeAsk(null));
+  $('ask-cancel').addEventListener('click', () => closeAsk(null));
+  $('ask-dialog').addEventListener('cancel', (e) => { e.preventDefault(); closeAsk(null); });
+  $('ask-dialog').addEventListener('click', (e) => { if (e.target === e.currentTarget) closeAsk(null); });
+
+  async function createRoomFlow() {
+    const name = await ask({ title: 'New room', label: 'Room name', placeholder: `${myName}'s room`, ok: 'Create room' });
+    if (name === null) return;
+    setLobbyBusy(true);
+    startHost(null, { name: cleanRoomName(name), created: true });
+  }
+
+  $('new-room-btn').addEventListener('click', createRoomFlow);
+  $('rooms-empty-create').addEventListener('click', createRoomFlow);
+  $('rooms-refresh').addEventListener('click', () => { $('rooms-error').hidden = true; refreshRooms(); });
+  $('rooms-join').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const c = normCode($('rooms-code').value);
+    if (c.length !== 6) {
+      $('rooms-error').textContent = 'Room codes are 6 characters, like K7QX2M.';
+      $('rooms-error').hidden = false;
+      $('rooms-code').focus();
+      return;
+    }
+    setLobbyBusy(true);
+    const saved = getSavedRoom(c);
+    startGuest(c, saved ? { fallbackHost: saved } : {});
+  });
+  $('rooms-code').addEventListener('input', (e) => { e.target.value = normCode(e.target.value); });
+  $('me-chip').addEventListener('click', async () => {
+    const n = await ask({ title: 'Your name', label: 'The name others see', value: myName, placeholder: myName, ok: 'Save', maxLength: 24 });
+    if (n === null) return;
+    myName = cleanName(n);
+    store.set('watchroom-name', myName);
+    $('name-input').value = myName;
+    renderMe();
+  });
 
   // =====================================================================
   //  EVENTS
@@ -1518,9 +1974,13 @@
   $('lobby-form').addEventListener('submit', (e) => {
     e.preventDefault();
     if (!readName()) return;
-    setLobbyBusy(true);
-    if (hashCode.length === 6) startGuest(hashCode);
-    else startHost();
+    if (hashCode.length === 6) {
+      setLobbyBusy(true);
+      const saved = getSavedRoom(hashCode);
+      startGuest(hashCode, saved ? { fallbackHost: saved } : {});
+    } else {
+      createRoomFlow();
+    }
   });
 
   $('join-btn').addEventListener('click', () => {
@@ -1587,17 +2047,98 @@
     });
   });
 
-  $('invite-btn').addEventListener('click', async () => {
-    const link = `${location.origin}${location.pathname}#${code}`;
-    try {
-      await navigator.clipboard.writeText(link);
-      toast('Invite link copied');
-    } catch {
-      toast(link, 6000);
+  // ---------- invites ----------
+  const inviteLink = () => `${location.origin}${location.pathname}#${code}`;
+  const inviteText = () => (room.name ? `Join me in "${room.name}" on Watchroom! Room ${code}` : `Join me on Watchroom! Room ${code}`);
+  const inviteMessage = () => `${inviteText()}: ${inviteLink()}`;
+
+  function renderQR(text) {
+    const box = $('invite-qr');
+    box.textContent = '';
+    if (typeof window.qrcode !== 'function') { box.parentElement.hidden = true; return; }
+    const q = window.qrcode(0, 'M');
+    q.addData(text);
+    q.make();
+    const n = q.getModuleCount();
+    const pad = 2;
+    let d = '';
+    for (let r = 0; r < n; r++) {
+      for (let c = 0; c < n; c++) if (q.isDark(r, c)) d += `M${c + pad},${r + pad}h1v1h-1z`;
     }
+    const size = n + pad * 2;
+    box.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${size} ${size}" shape-rendering="crispEdges" role="img" aria-label="QR code for the invite link"><rect width="${size}" height="${size}" fill="#fff"/><path d="${d}" fill="#111"/></svg>`;
+  }
+
+  function legacyCopy(text) {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    ($('invite-dialog').open ? $('invite-dialog') : document.body).appendChild(ta);
+    ta.select();
+    let ok = false;
+    try { ok = document.execCommand('copy'); } catch { /* unsupported */ }
+    ta.remove();
+    return ok;
+  }
+
+  async function copyText(text) {
+    try { await navigator.clipboard.writeText(text); return true; }
+    catch { return legacyCopy(text); }
+  }
+
+  // Feedback inside the dialog (a toast would sit underneath it).
+  function flash(btn, ok) {
+    const label = btn.dataset.label || btn.textContent;
+    btn.dataset.label = label;
+    btn.textContent = ok ? 'Copied!' : 'Press Ctrl+C';
+    clearTimeout(btn._t);
+    btn._t = setTimeout(() => { btn.textContent = label; }, 1600);
+  }
+
+  function openInvite() {
+    if (!code) return;
+    const link = inviteLink();
+    $('invite-code').textContent = code;
+    $('invite-link').value = link;
+    $('invite-message').textContent = inviteMessage();
+    $('invite-whatsapp').href = 'https://wa.me/?text=' + encodeURIComponent(inviteMessage());
+    $('invite-telegram').href = 'https://t.me/share/url?url=' + encodeURIComponent(link) + '&text=' + encodeURIComponent(inviteText());
+    $('invite-native').hidden = typeof navigator.share !== 'function';
+    renderQR(link);
+    const d = $('invite-dialog');
+    if (typeof d.showModal === 'function') {
+      if (!d.open) d.showModal();
+      $('invite-copy').focus();
+    } else {
+      copyText(link).then((ok) => toast(ok ? 'Invite link copied' : link, ok ? 2600 : 8000));
+    }
+  }
+
+  $('invite-btn').addEventListener('click', openInvite);
+  $('people-invite').addEventListener('click', openInvite);
+  $('invite-copy').addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    const ok = await copyText(inviteLink());
+    if (!ok) $('invite-link').select();
+    flash(btn, ok);
+  });
+  $('invite-copy-msg').addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    flash(btn, await copyText(inviteMessage()));
+  });
+  $('invite-native').addEventListener('click', () => {
+    navigator.share({ title: 'Watchroom', text: inviteText(), url: inviteLink() }).catch(() => { /* closed */ });
+  });
+  $('invite-link').addEventListener('focus', (e) => e.target.select());
+  $('invite-dialog').addEventListener('click', (e) => {
+    // A click on the dimmed backdrop lands on the dialog element itself.
+    if (e.target === e.currentTarget) e.currentTarget.close();
   });
 
   $('leave-btn').addEventListener('click', () => {
+    saveSnapshot();
     leaving = true;
     stopLocalShare();
     if (hostConn && hostConn.open) { try { hostConn.send({ t: 'bye' }); } catch { /* ignore */ } }
@@ -1608,6 +2149,7 @@
   });
 
   window.addEventListener('pagehide', () => {
+    if ($('lobby').hidden) saveSnapshot();
     leaving = true;
     stopLocalShare();
     if (hostConn && hostConn.open) { try { hostConn.send({ t: 'bye' }); } catch { /* ignore */ } }
@@ -1619,10 +2161,14 @@
     const tag = $('build-tag');
     if (tag) tag.textContent = tag.dataset.build === '__BUILD__' ? 'dev' : tag.dataset.build;
     const saved = store.get('watchroom-name');
-    if (saved) $('name-input').value = saved;
+    if (saved) { $('name-input').value = saved; myName = cleanName(saved); }
     if (!window.Peer) {
       lobbyError('A required script failed to load. Check your connection or ad blocker, then reload.');
       $('create-btn').disabled = true;
+      return;
+    }
+    if (hashCode.length !== 6 && saved) {
+      showRoomsView();
       return;
     }
     if (hashCode.length === 6) {
@@ -1633,13 +2179,13 @@
       const another = document.createElement('button');
       another.type = 'button';
       another.className = 'btn btn-ghost btn-wide';
-      another.textContent = 'Create a new room instead';
+      another.textContent = saved ? 'Go to my rooms instead' : 'Create a new room instead';
       another.addEventListener('click', () => {
         hashCode = '';
         history.replaceState(null, '', location.pathname);
         if (!readName()) return;
-        setLobbyBusy(true);
-        startHost();
+        if (saved) showRoomsView();
+        else createRoomFlow();
       });
       $('create-btn').after(another);
     }

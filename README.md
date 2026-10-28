@@ -2,7 +2,8 @@
 
 Watch YouTube videos and video files in sync with friends. Make a room, send the link, press play.
 
-- **Rooms with a 6-character code** and a shareable invite link (`…/watchroom/#K7QX2M`)
+- **My Rooms**: every room you create or join is saved in your browser, with a live check of who's inside right now
+- **Named rooms with invites**: a 6-character code, an invite link, a QR code, and one-tap sharing to WhatsApp, Telegram or your phone's share menu
 - **Synced playback**: play, pause and seeking happen for everyone, and late joiners land at the right second
 - **YouTube links** (`watch?v=`, `youtu.be/`, `shorts/`, `&t=` start times) and **direct video links** (`.mp4`, `.webm`, `.m3u8` streams)
 - **Share a tab**: stream one of your browser tabs to the room and browse YouTube or any site there while everyone watches
@@ -12,9 +13,19 @@ Watch YouTube videos and video files in sync with friends. Make a room, send the
 
 ## Use it
 
-1. Open the site, type your name, click **Create a room**.
-2. Click **Copy link** in the top bar and send it to your friends.
+1. Open the site, type your name, click **Create a room** and give it a name.
+2. The **Invite** window opens: copy the link, scan the QR code, or send it with WhatsApp or Telegram. Reopen it any time with **Invite** in the top bar.
 3. Paste a link into the bar under the player and click **Play now** or **Add to queue**.
+
+### My Rooms
+
+Next time you open the site you land on **My Rooms**: every room you've created or joined, newest first. Each one shows who's inside right now (it re-checks every 20 seconds, or press the refresh button).
+
+- **Click a room** to go in. If people are inside you join them; if it's empty you reopen it under the same code, with its name, video and queue restored, so old invite links keep working.
+- **☰ menu**: rename it, copy its invite link, or remove it from the list.
+- **Your name** (top right) can be changed any time.
+
+Rooms are saved in your browser only. Another browser or device starts with an empty list until you open your rooms there.
 
 Everyone in the room can control playback, like Watch2gether.
 
@@ -51,6 +62,7 @@ python3 -m http.server 8080
 - **The host**: whoever creates the room. Their browser keeps the room state (current video, position, queue, chat) and relays it. Guests send their actions to the host, who applies them and broadcasts the result.
 - **Tab sharing**: the sharer's browser sends the tab's video and audio straight to each person in the room as a WebRTC stream. The sharer uploads one copy per viewer, so it works best for small groups (up to about 5 viewers on a typical home connection).
 - **Sync**: state is stored as "at host time *T* the video was at position *P*, playing or paused". Guests measure the offset between their clock and the host's with ping/pong, compute where the video should be, and seek when they drift more than about 1.25 s.
+- **My Rooms check**: the lobby briefly connects to each saved room and asks who's inside; the room answers with names and what's playing, then hangs up. Nothing is stored on a server.
 - **Host leaves**: the guest who has been in the room longest re-opens it under the same code, and everyone else reconnects to them. The video and queue carry over.
 
 ## Limits
@@ -69,7 +81,7 @@ index.html           page markup
 css/style.css        styles (dark and light themes)
 js/app.js            rooms, sync, player, UI
 js/config.js         optional PeerJS server / TURN settings
-vendor/              PeerJS 1.5.4 and hls.js 1.5.13 (MIT and Apache-2.0)
+vendor/              PeerJS 1.5.4, hls.js 1.5.13, qrcode-generator 1.4.4 (MIT, Apache-2.0, MIT)
 ```
 
 ## License

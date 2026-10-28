@@ -16,7 +16,8 @@
 
 <!-- ============ LOBBY ============ -->
 <main id="lobby" class="lobby">
-  <div class="lobby-inner">
+  <!-- Welcome: first visit, or arriving from an invite link -->
+  <div id="welcome" class="lobby-inner">
     <div class="brand brand-lg"><span class="brand-mark" aria-hidden="true"></span>watchroom</div>
     <h1 class="lobby-title">Press play together.</h1>
     <p class="lobby-lede">Make a room, send the link, and everyone watches the same YouTube video or video file at the same second. Pause, skip and queue for the whole room. No account, no install.</p>
@@ -43,17 +44,62 @@
       <li>Runs peer-to-peer in your browsers</li>
     </ul>
   </div>
+
+  <!-- My Rooms: returning visitors -->
+  <div id="rooms-view" class="rooms-view" hidden>
+    <header class="rooms-top">
+      <div class="brand brand-lg"><span class="brand-mark" aria-hidden="true"></span>watchroom</div>
+      <button id="me-chip" class="me-chip" type="button" title="Change your name">
+        <span id="me-name"></span>
+        <span id="me-avatar" class="avatar" aria-hidden="true"></span>
+      </button>
+    </header>
+
+    <section class="rooms-main">
+      <div class="rooms-head">
+        <h1 class="rooms-title">My Rooms</h1>
+        <div class="rooms-actions">
+          <form id="rooms-join" class="rooms-join" autocomplete="off">
+            <label class="sr-only" for="rooms-code">Room code</label>
+            <input id="rooms-code" class="input input-code" maxlength="6" placeholder="CODE" spellcheck="false" autocapitalize="characters">
+            <button class="btn btn-ghost" type="submit">Join</button>
+          </form>
+          <button id="new-room-btn" class="btn btn-primary" type="button">Create a room</button>
+          <button id="rooms-refresh" class="btn btn-ghost icon-only" type="button" title="Check who's in your rooms" aria-label="Check who's in your rooms"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.34-5.66M20 4v5h-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+        </div>
+      </div>
+
+      <p id="rooms-error" class="form-error" role="alert" hidden></p>
+
+      <ul id="rooms-list" class="rooms-list"></ul>
+
+      <div id="rooms-empty" class="rooms-empty" hidden>
+        <p class="rooms-empty-title">No rooms yet</p>
+        <p>Rooms you create or join show up here, with who's inside right now.</p>
+        <button id="rooms-empty-create" class="btn btn-primary" type="button">Create your first room</button>
+      </div>
+
+      <div id="row-menu" class="row-menu" role="menu" hidden>
+        <button type="button" role="menuitem" data-act="rename">Rename</button>
+        <button type="button" role="menuitem" data-act="copy">Copy invite link</button>
+        <button type="button" role="menuitem" data-act="remove" class="danger">Remove from list</button>
+      </div>
+
+      <p class="rooms-note">Your rooms are saved in this browser. A room is open while someone is inside it. Opening an empty room brings back its name, video and queue, and its invite link keeps working.</p>
+    </section>
+  </div>
 </main>
 
 <!-- ============ ROOM ============ -->
 <div id="room" class="room" hidden>
   <header class="topbar">
     <div class="brand"><span class="brand-mark" aria-hidden="true"></span>watchroom</div>
+    <span id="room-name" class="room-name-top"></span>
 
-    <button id="invite-btn" class="room-code" type="button" title="Copy invite link">
+    <button id="invite-btn" class="room-code" type="button" title="Invite people to this room">
       <span class="room-code-label">Room</span>
       <span id="room-code" class="room-code-value">------</span>
-      <span class="room-code-copy">Copy link</span>
+      <span class="room-code-copy">Invite</span>
     </button>
 
     <div class="topbar-right">
@@ -138,6 +184,9 @@
       </section>
 
       <section id="panel-people" class="panel" role="tabpanel" aria-labelledby="tab-people" hidden>
+        <div class="people-head">
+          <button id="people-invite" class="btn btn-primary btn-sm btn-wide" type="button">Invite people</button>
+        </div>
         <ul id="people-list" class="people-list"></ul>
         <p class="panel-note">Everyone can play, pause, seek and change the video. The host's browser keeps the room in sync; if the host leaves, the next person takes over.</p>
         <p class="build-tag">Version <span id="build-tag" data-build="__BUILD__"></span></p>
@@ -146,10 +195,65 @@
   </div>
 </div>
 
+<dialog id="invite-dialog" class="invite" aria-labelledby="invite-title">
+  <form method="dialog" class="invite-inner">
+    <header class="invite-head">
+      <div>
+        <h2 id="invite-title" class="invite-title">Invite people</h2>
+        <p class="invite-sub">Anyone with this link joins room <strong id="invite-code">------</strong>. It works while at least one person is in the room.</p>
+      </div>
+      <button class="icon-btn invite-close" value="close" aria-label="Close">✕</button>
+    </header>
+
+    <div class="invite-body">
+      <div class="invite-main">
+        <label class="field-label" for="invite-link">Invite link</label>
+        <div class="invite-row">
+          <input id="invite-link" class="input" readonly>
+          <button id="invite-copy" class="btn btn-primary" type="button">Copy link</button>
+        </div>
+
+        <div class="invite-share">
+          <button id="invite-native" class="btn btn-ghost btn-sm" type="button" hidden>Share…</button>
+          <a id="invite-whatsapp" class="btn btn-ghost btn-sm" target="_blank" rel="noopener">WhatsApp</a>
+          <a id="invite-telegram" class="btn btn-ghost btn-sm" target="_blank" rel="noopener">Telegram</a>
+          <button id="invite-copy-msg" class="btn btn-ghost btn-sm" type="button">Copy message</button>
+        </div>
+
+        <span class="eyebrow">Message for Discord, Instagram or anywhere</span>
+        <p id="invite-message" class="invite-message"></p>
+      </div>
+
+      <figure class="invite-qr">
+        <div id="invite-qr" class="qr"></div>
+        <figcaption>Scan with a phone camera to join</figcaption>
+      </figure>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="ask-dialog" class="invite ask" aria-labelledby="ask-title">
+  <form id="ask-form" class="invite-inner" autocomplete="off">
+    <header class="invite-head">
+      <h2 id="ask-title" class="invite-title">New room</h2>
+      <button id="ask-close" class="icon-btn invite-close" type="button" aria-label="Close">✕</button>
+    </header>
+    <div class="ask-field">
+      <label id="ask-label" class="field-label" for="ask-input">Room name</label>
+      <input id="ask-input" class="input" maxlength="40">
+    </div>
+    <div class="dialog-actions">
+      <button id="ask-cancel" class="btn btn-ghost" type="button">Cancel</button>
+      <button id="ask-ok" class="btn btn-primary" type="submit">Create room</button>
+    </div>
+  </form>
+</dialog>
+
 <div id="toast" class="toast" role="status" hidden></div>
 
 <script src="vendor/peerjs-1.5.4.min.js"></script>
 <script src="vendor/hls.light-1.5.13.min.js" defer></script>
+<script src="vendor/qrcode-generator-1.4.4.min.js"></script>
 <script src="js/config.js?v=__BUILD__"></script>
 <script src="js/app.js?v=__BUILD__"></script>
 </body>
