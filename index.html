@@ -116,7 +116,7 @@
 
         <div id="share-layer" class="share-layer" hidden>
           <video id="share-video" playsinline autoplay></video>
-          <div class="live-badge"><span class="live-dot" aria-hidden="true"></span><span>LIVE</span><span id="share-who"></span></div>
+          <div class="live-badge"><span class="live-dot" aria-hidden="true"></span><span>LIVE</span><span id="share-who"></span><span id="share-res" class="share-res"></span></div>
           <p id="share-wait" class="share-wait" hidden></p>
         </div>
 
@@ -157,6 +157,17 @@
           <span class="eyebrow">Now playing</span>
           <span id="now-title" class="now-title">—</span>
           <span id="now-by" class="now-by"></span>
+        </div>
+        <div id="share-controls" class="share-controls" hidden>
+          <label class="quality">
+            <span class="eyebrow">Share quality</span>
+            <select id="share-quality" class="select">
+              <option value="smooth">Smooth · 720p</option>
+              <option value="sharp">Sharp · 1080p</option>
+              <option value="max">Max · 1080p 60 fps</option>
+            </select>
+          </label>
+          <span id="share-upload" class="share-upload"></span>
         </div>
         <button id="next-btn" class="btn btn-ghost btn-sm" type="button" disabled>Next in queue</button>
       </div>

@@ -553,6 +553,119 @@
   let viewSid = null;
   let pendingCalls = [];            // calls that arrived before the room state named their sharer
 
+  // Quality presets for the sharer. Each viewer gets their own copy, so upload ≈ kbps × viewers.
+  const QUALITY = {
+    smooth: { w: 1280, h: 720, fps: 30, kbps: 2500 },
+    sharp: { w: 1920, h: 1080, fps: 30, kbps: 5000 },
+    max: { w: 1920, h: 1080, fps: 60, kbps: 9000 },
+  };
+  const AUDIO_KBPS = 128;
+  let qualityKey = QUALITY[store.get('watchroom-quality')] ? store.get('watchroom-quality') : 'sharp';
+  const videoConstraints = (q) => ({
+    width: { ideal: q.w, max: q.w }, height: { ideal: q.h, max: q.h }, frameRate: { ideal: q.fps, max: q.fps },
+  });
+
+  /** Moves one codec to the front of an m= line so both sides pick it when they can. */
+  function preferCodec(sdp, kind, codec) {
+    const lines = sdp.split(/\r\n/);
+    const m = lines.findIndex((l) => l.startsWith(`m=${kind} `));
+    if (m < 0) return sdp;
+    let end = lines.findIndex((l, i) => i > m && l.startsWith('m='));
+    if (end < 0) end = lines.length;
+    const pts = [];
+    const nameRe = new RegExp(`^a=rtpmap:(\\d+) ${codec}/`, 'i');
+    for (let i = m + 1; i < end; i++) { const r = lines[i].match(nameRe); if (r) pts.push(r[1]); }
+    if (!pts.length) return sdp;
+    for (let i = m + 1; i < end; i++) {               // keep each codec's retransmission partner with it
+      const r = lines[i].match(/^a=fmtp:(\d+) apt=(\d+)/);
+      if (r && pts.includes(r[2])) pts.push(r[1]);
+    }
+    const parts = lines[m].split(' ');
+    const list = parts.slice(3);
+    const first = pts.filter((p) => list.includes(p));
+    lines[m] = [...parts.slice(0, 3), ...first, ...list.filter((p) => !first.includes(p))].join(' ');
+    return lines.join('\r\n');
+  }
+
+  /** Stereo, music-quality Opus instead of WebRTC's mono voice default. */
+  function stereoOpus(sdp) {
+    const r = sdp.match(/a=rtpmap:(\d+) opus\/48000\/2/i);
+    if (!r) return sdp;
+    const pt = r[1];
+    const want = ['stereo=1', 'sprop-stereo=1', `maxaveragebitrate=${AUDIO_KBPS * 1000}`, 'usedtx=0'];
+    const fmtp = new RegExp(`a=fmtp:${pt} ([^\\r\\n]*)`);
+    if (fmtp.test(sdp)) {
+      return sdp.replace(fmtp, (_all, params) => {
+        const keep = params.split(';').map((x) => x.trim()).filter((x) => x && !/^(stereo|sprop-stereo|maxaveragebitrate|usedtx)=/i.test(x));
+        return `a=fmtp:${pt} ${[...keep, ...want].join(';')}`;
+      });
+    }
+    return sdp.replace(r[0], `${r[0]}\r\na=fmtp:${pt} ${want.join(';')}`);
+  }
+
+  // VP9 looks best per bit; with more viewers, H.264 is usually hardware-encoded and spares the CPU,
+  // since every viewer means one more encoder running on the sharer's computer.
+  const sdpFor = (codec) => (sdp) => stereoOpus(codec ? preferCodec(sdp, 'video', codec) : sdp);
+
+  /** Applies the bitrate and frame-rate caps to one viewer's connection. Resolves true once applied. */
+  async function tuneSenders(call) {
+    const pc = call && call.peerConnection;
+    if (!pc) return false;
+    const q = QUALITY[qualityKey];
+    let applied = false;
+    for (const sender of pc.getSenders()) {
+      if (!sender.track) continue;
+      const p = sender.getParameters();
+      if (!p.encodings || !p.encodings.length) continue;   // not negotiated yet
+      if (sender.track.kind === 'video') {
+        p.encodings[0].maxBitrate = q.kbps * 1000;
+        p.encodings[0].maxFramerate = q.fps;
+      } else {
+        p.encodings[0].maxBitrate = AUDIO_KBPS * 1000;
+      }
+      try { await sender.setParameters(p); applied = true; } catch { /* older browsers */ }
+    }
+    return applied;
+  }
+
+  function tuneWhenConnected(call) {
+    let tries = 0;
+    const t = setInterval(async () => {
+      tries++;
+      const pc = call.peerConnection;
+      const up = pc && (pc.connectionState === 'connected' || pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed');
+      if ((up && await tuneSenders(call)) || tries > 30 || !outCalls.size) clearInterval(t);
+    }, 1000);
+  }
+
+  async function setQuality(key) {
+    if (!QUALITY[key]) return;
+    qualityKey = key;
+    store.set('watchroom-quality', key);
+    const vt = localShare && localShare.getVideoTracks()[0];
+    if (vt) { try { await vt.applyConstraints(videoConstraints(QUALITY[key])); } catch { /* keeps the old size */ } }
+    for (const c of outCalls.values()) tuneSenders(c);
+    renderShareControls();
+  }
+
+  function renderShareControls() {
+    $('share-controls').hidden = !localShare;
+    if (!localShare) return;
+    $('share-quality').value = qualityKey;
+    const viewers = room.users.filter((u) => u.id && u.id !== myId).length;
+    const mbps = (viewers * (QUALITY[qualityKey].kbps + AUDIO_KBPS)) / 1000;
+    $('share-upload').textContent = viewers
+      ? `Needs about ${mbps < 10 ? mbps.toFixed(1) : Math.round(mbps)} Mbps upload for ${viewers} ${viewers === 1 ? 'person' : 'people'}.${qualityKey === 'smooth' ? '' : ' Pick Smooth if it stutters.'}`
+      : 'Nobody else is watching yet.';
+  }
+  $('share-quality').addEventListener('change', (e) => setQuality(e.target.value));
+
+  // Show viewers the resolution actually arriving.
+  shareVideo.addEventListener('resize', () => {
+    const h = shareVideo.videoHeight;
+    $('share-res').textContent = h ? `${h}p` : '';
+  });
+
   async function startShare() {
     if (!canShare) {
       toast('Sharing needs Chrome, Edge or Firefox on a computer. You can still watch shares on this device.', 5000);
@@ -589,8 +702,8 @@
 
   async function pickDisplay() {
     const rich = {
-      video: { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30, max: 30 } },
-      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+      video: videoConstraints(QUALITY[qualityKey]),
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: { ideal: 2 } },
       preferCurrentTab: false,
       selfBrowserSurface: 'exclude',
       surfaceSwitching: 'include',
@@ -679,7 +792,7 @@
     };
     call.on('close', gone);
     call.on('error', gone);
-    call.answer();
+    call.answer(undefined, { sdpTransform: sdpFor(null) });
   }
 
   function closeView() {
@@ -706,10 +819,12 @@
         }
         for (const id of want) {
           if (outCalls.has(id) || !peer || peer.destroyed || peer.disconnected) continue;
-          const c = peer.call(id, localShare, { metadata: { sid: s.sid } });
+          const codec = want.size <= 2 ? 'VP9' : 'H264';
+          const c = peer.call(id, localShare, { metadata: { sid: s.sid }, sdpTransform: sdpFor(codec) });
           if (!c) continue;
           c._sid = s.sid;
           outCalls.set(id, c);
+          tuneWhenConnected(c);
           const drop = () => { if (outCalls.get(id) === c) outCalls.delete(id); };
           c.on('close', drop);
           c.on('error', drop);
@@ -772,6 +887,8 @@
       }
     }
 
+    if (!shareVideo.srcObject || mine) $('share-res').textContent = mine && shareVideo.videoHeight ? `${shareVideo.videoHeight}p` : '';
+    renderShareControls();
     $('share-btn').hidden = !!localShare || !canShare;   // phones can watch shares but not start them
     $('stop-share-btn').hidden = !localShare;
     $('share-btn').title = 'Stream one of your browser tabs to the room';

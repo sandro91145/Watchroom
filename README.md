@@ -37,6 +37,16 @@ For anything a link can't play, click **Share a tab** under the player:
 2. Use that tab as normal: search, open YouTube, sign in, play videos. Everyone in the room sees and hears it live in the player.
 3. Click **Stop sharing** (or the browser's own stop button) when you're done. Starting a video from the link bar also ends the share.
 
+While you share, pick the quality under the player:
+
+| Preset | Picture | Upload per viewer |
+|---|---|---|
+| Smooth | 720p, 30 fps | about 2.6 Mbps |
+| Sharp (default) | 1080p, 30 fps | about 5.1 Mbps |
+| Max | 1080p, 60 fps | about 9.1 Mbps |
+
+The panel shows the total upload needed for the people watching. Sound is sent in stereo at 128 kb/s. For the sharpest picture, maximise the shared tab's window, put the video in fullscreen inside it, and set YouTube's own quality to 1080p.
+
 Sharing works in desktop Chrome and Edge. Firefox and Safari can share a tab without sound. Phones can watch shares but not start them.
 
 ## Deploy on GitHub Pages
@@ -60,7 +70,7 @@ python3 -m http.server 8080
 
 - **Connections**: [PeerJS](https://peerjs.com) handles WebRTC. Its free public server only introduces browsers to each other; video, chat and controls go directly between browsers.
 - **The host**: whoever creates the room. Their browser keeps the room state (current video, position, queue, chat) and relays it. Guests send their actions to the host, who applies them and broadcasts the result.
-- **Tab sharing**: the sharer's browser sends the tab's video and audio straight to each person in the room as a WebRTC stream. The sharer uploads one copy per viewer, so it works best for small groups (up to about 5 viewers on a typical home connection).
+- **Tab sharing**: the sharer's browser sends the tab's video and audio straight to each person in the room as a WebRTC stream. The sharer uploads one copy per viewer, so it works best for small groups (up to about 5 viewers on a typical home connection). Video uses VP9 for up to 2 viewers and H.264 (usually hardware-encoded, lighter on the CPU) for larger groups; audio is stereo Opus at 128 kb/s instead of WebRTC's mono voice default.
 - **Sync**: state is stored as "at host time *T* the video was at position *P*, playing or paused". Guests measure the offset between their clock and the host's with ping/pong, compute where the video should be, and seek when they drift more than about 1.25 s.
 - **My Rooms check**: the lobby briefly connects to each saved room and asks who's inside; the room answers with names and what's playing, then hangs up. Nothing is stored on a server.
 - **Host leaves**: the guest who has been in the room longest re-opens it under the same code, and everyone else reconnects to them. The video and queue carry over.
